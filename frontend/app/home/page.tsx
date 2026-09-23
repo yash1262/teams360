@@ -1,12 +1,12 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { useRouter } from 'next/navigation';
 import { getCurrentUser, logout, authenticatedFetch } from '@/lib/auth';
 import { HEALTH_DIMENSIONS } from '@/lib/data';
 import { API_BASE_URL } from '@/lib/api/client';
 import { getOrgConfig, getHierarchyLevel } from '@/lib/org-config';
-// Assessment period import removed — period is team-specific, computed on survey page
+import { getAssessmentPeriod, getSelectablePeriods, toCadence } from '@/lib/assessment-period';
 import { LogOut, Building2, ChevronDown, ClipboardList, TrendingUp, Calendar, Clock, CalendarClock } from 'lucide-react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar } from 'recharts';
 import { getTeamInfoCached, TeamInfo } from '@/lib/api/teams';
@@ -87,8 +87,8 @@ export default function MemberHomePage() {
   const [brandingName, setBrandingName] = useState<string>('');
   const [brandingLogo, setBrandingLogo] = useState<string | null>(null);
   const [showOnboarding, setShowOnboarding] = useState(false);
-
-  const currentPeriod = ''; // Period is team-specific; shown on survey page after team selection
+  const [assessmentPeriod, setAssessmentPeriod] = useState<string>('');
+  const [autoAssessmentPeriod, setAutoAssessmentPeriod] = useState<string>('');
 
   useEffect(() => {
     const currentUser = getCurrentUser();
@@ -113,7 +113,12 @@ export default function MemberHomePage() {
     // Fetch team info for cadence
     const teamId = currentUser.teamIds && currentUser.teamIds.length > 0 ? currentUser.teamIds[0] : null;
     if (teamId) {
-      getTeamInfoCached(teamId).then(setTeam).catch(() => {});
+      getTeamInfoCached(teamId).then((teamInfo) => {
+        setTeam(teamInfo);
+        const currentPeriod = getAssessmentPeriod(new Date(), toCadence(teamInfo.cadence));
+        setAutoAssessmentPeriod(currentPeriod);
+        setAssessmentPeriod(currentPeriod);
+      }).catch(() => {});
     }
   }, [router]);
 
@@ -174,8 +179,15 @@ export default function MemberHomePage() {
     router.push('/login');
   };
 
+  const periodOptions = useMemo(() => {
+    if (!team) return [];
+    const options = getSelectablePeriods(toCadence(team.cadence));
+    return options.includes(assessmentPeriod) ? options : [assessmentPeriod, ...options];
+  }, [team, assessmentPeriod]);
+
   const handleTakeSurvey = () => {
-    router.push('/survey');
+    const query = assessmentPeriod ? `?period=${encodeURIComponent(assessmentPeriod)}` : '';
+    router.push(`/survey${query}`);
   };
 
   const getUserLevelName = () => {
@@ -270,19 +282,52 @@ export default function MemberHomePage() {
 
         {/* Current Period CTA */}
         <div className="bg-gradient-to-r from-blue-600 to-blue-700 rounded-xl p-6 mb-8 text-white">
-          <div className="flex items-center justify-between">
-            <div>
+          <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-6">
+            <div className="flex-1 min-w-0">
               <div className="flex items-center space-x-2 mb-2">
                 <Calendar className="h-5 w-5" />
-                <span data-testid="current-period" className="text-sm font-medium opacity-90">Current Period</span>
+                <span data-testid="current-period" className="text-sm font-medium opacity-90">
+                  {autoAssessmentPeriod ? `Current Period: ${autoAssessmentPeriod}` : 'Current Period'}
+                </span>
               </div>
               <h3 className="text-xl font-bold mb-2">Ready to share your feedback?</h3>
-              <p className="text-blue-100">Your input helps the team improve. Take a few minutes to complete the health check.</p>
+              <p className="text-blue-100 mb-4">Your input helps the team improve. Take a few minutes to complete the health check.</p>
+
+              {team && (
+                <div
+                  data-testid="assessment-period-panel"
+                  className="bg-white/10 border border-white/30 rounded-lg p-4 max-w-sm"
+                >
+                  <h4 className="text-sm font-semibold text-white mb-3">Select assessment period</h4>
+                  <label htmlFor="home-period-select" className="block text-xs font-medium text-blue-100 mb-1">
+                    Assessment period
+                  </label>
+                  <div className="relative">
+                    <select
+                      id="home-period-select"
+                      data-testid="assessment-period-select"
+                      value={assessmentPeriod}
+                      onChange={(e) => setAssessmentPeriod(e.target.value)}
+                      className="w-full appearance-none pl-3 pr-8 py-2 text-sm font-medium bg-white text-gray-900 border border-white/60 rounded-lg shadow-sm focus:outline-none focus:ring-2 focus:ring-white/70 cursor-pointer"
+                    >
+                      {periodOptions.map((p) => (
+                        <option key={p} value={p}>
+                          {p}{p === autoAssessmentPeriod ? ' (current)' : ''}
+                        </option>
+                      ))}
+                    </select>
+                    <ChevronDown className="w-4 h-4 text-gray-500 absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  </div>
+                  <p className="text-xs text-blue-100 mt-2">
+                    The period is selected automatically based on today&apos;s date. Change it if you are completing a previous assessment.
+                  </p>
+                </div>
+              )}
             </div>
             <button
               data-testid="take-survey-btn"
               onClick={handleTakeSurvey}
-              className="bg-white text-blue-600 px-6 py-3 rounded-lg font-semibold hover:bg-blue-50 transition-colors flex items-center space-x-2"
+              className="bg-white text-blue-600 px-6 py-3 rounded-lg font-semibold hover:bg-blue-50 transition-colors flex items-center space-x-2 self-start flex-shrink-0"
             >
               <ClipboardList className="h-5 w-5" />
               <span>Take Survey</span>

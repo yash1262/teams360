@@ -5,12 +5,12 @@ import { useRouter } from 'next/navigation';
 import { getCurrentUser, logout, authenticatedFetch } from '@/lib/auth';
 import { HEALTH_DIMENSIONS } from '@/lib/data';
 import { getOrgConfig, getHierarchyLevel, getUserPermissions } from '@/lib/org-config';
-import { LogOut, Building2, ChevronDown, BarChart3, LineChart as LineChartIcon, Users as UsersIcon, Activity, ClipboardList, TrendingUp, TrendingDown, Minus, LayoutGrid, List, Info, CheckCircle, Download, ListTodo } from 'lucide-react';
+import { LogOut, Building2, ChevronDown, BarChart3, LineChart as LineChartIcon, Users as UsersIcon, Activity, ClipboardList, TrendingUp, TrendingDown, Minus, LayoutGrid, List, Info, CheckCircle, Download, ListTodo, X } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import { AlertCircle } from 'lucide-react';
 import { getTeamSubmissionStatus, getAssessmentPeriods, TeamSubmissionStatus } from '@/lib/api/health-checks';
 import { API_BASE_URL } from '@/lib/api/client';
-import { getAssessmentPeriod, toCadence } from '@/lib/assessment-period';
+import { getAssessmentPeriod, getSelectablePeriods, parseAssessmentPeriod, toCadence } from '@/lib/assessment-period';
 import { getTeamInfoCached } from '@/lib/api/teams';
 import { RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, LineChart, Line, ResponsiveContainer } from 'recharts';
 import OnboardingModal from '@/components/OnboardingModal';
@@ -65,6 +65,13 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(true);
   const [selectedPeriod, setSelectedPeriod] = useState<string>('');
   const [assessmentPeriodOptions, setAssessmentPeriodOptions] = useState<string[]>([]);
+  // Assessment period to take a new survey for (Take Survey / Post-Workshop Survey buttons).
+  // Separate from `selectedPeriod` above, which is the dashboard's chart/data filter.
+  const [takeSurveyPeriod, setTakeSurveyPeriod] = useState<string>('');
+  const [autoTakeSurveyPeriod, setAutoTakeSurveyPeriod] = useState<string>('');
+  const [teamCadence, setTeamCadence] = useState<string>('half-yearly');
+  // Which survey flow the period-selection modal is being shown for, or null when closed.
+  const [pendingSurveyType, setPendingSurveyType] = useState<'individual' | 'post_workshop' | null>(null);
   const [submissionStatus, setSubmissionStatus] = useState<TeamSubmissionStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [responseView, setResponseView] = useState<'matrix' | 'cards'>('matrix');
@@ -114,7 +121,10 @@ export default function DashboardPage() {
       getTeamInfoCached(firstTeamId)
         .then((teamInfo) => {
           setTeamMembers(teamInfo.members.map(m => ({ id: m.id, name: m.fullName })));
+          setTeamCadence(teamInfo.cadence);
           const currentPeriod = getAssessmentPeriod(new Date(), toCadence(teamInfo.cadence));
+          setAutoTakeSurveyPeriod(currentPeriod);
+          setTakeSurveyPeriod(currentPeriod);
           return getTeamSubmissionStatus(firstTeamId, currentPeriod);
         })
         .catch(() => {
@@ -288,7 +298,10 @@ export default function DashboardPage() {
     getTeamInfoCached(newTeamId)
       .then((teamInfo) => {
         setTeamMembers(teamInfo.members.map(m => ({ id: m.id, name: m.fullName })));
+        setTeamCadence(teamInfo.cadence);
         const currentPeriod = getAssessmentPeriod(new Date(), toCadence(teamInfo.cadence));
+        setAutoTakeSurveyPeriod(currentPeriod);
+        setTakeSurveyPeriod(currentPeriod);
         return getTeamSubmissionStatus(newTeamId, currentPeriod);
       })
       .catch(() => {
@@ -304,7 +317,23 @@ export default function DashboardPage() {
     router.push('/login');
   };
 
+  // Builds the /survey URL for the "Take Survey" / "Post-Workshop Survey" buttons, carrying the
+  // Team Lead's selected assessment period (falls back to auto-detection if somehow invalid/empty).
+  const buildSurveyUrl = (surveyType?: 'post_workshop') => {
+    const params = new URLSearchParams();
+    if (teamId) params.set('team', teamId);
+    if (surveyType) params.set('type', surveyType);
+    if (takeSurveyPeriod && parseAssessmentPeriod(takeSurveyPeriod)) params.set('period', takeSurveyPeriod);
+    const query = params.toString();
+    return query ? `/survey?${query}` : '/survey';
+  };
+
   // All useMemo hooks must be called unconditionally — before any early return
+  const takeSurveyPeriodOptions = useMemo(() => {
+    const options = getSelectablePeriods(toCadence(teamCadence));
+    return options.includes(takeSurveyPeriod) ? options : [takeSurveyPeriod, ...options];
+  }, [teamCadence, takeSurveyPeriod]);
+
   const matrixDims = useMemo(
     () => individualResponses[0]?.responses || [],
     [individualResponses]
@@ -504,7 +533,7 @@ export default function DashboardPage() {
             <div className="flex items-center gap-4">
               {/* Take Survey Button */}
               <button
-                onClick={() => router.push(teamId ? `/survey?team=${teamId}` : '/survey')}
+                onClick={() => setPendingSurveyType('individual')}
                 data-testid="take-survey-button"
                 className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-colors"
               >
@@ -523,7 +552,7 @@ export default function DashboardPage() {
                 </span>
               ) : (
                 <button
-                  onClick={() => router.push(teamId ? `/survey?type=post_workshop&team=${teamId}` : '/survey?type=post_workshop')}
+                  onClick={() => setPendingSurveyType('post_workshop')}
                   data-testid="post-workshop-survey-button"
                   title="Record your team's workshop consensus"
                   className="flex items-center gap-2 px-4 py-2 rounded-lg transition-colors bg-amber-500 text-white hover:bg-amber-600"
