@@ -10,7 +10,7 @@
  * Legacy format "YYYY - 1st/2nd Half" is parsed for backward compatibility.
  */
 
-import { getAssessmentPeriod, getCurrentAssessmentPeriod, parseAssessmentPeriod, compareAssessmentPeriods, Cadence } from '../assessment-period';
+import { getAssessmentPeriod, getCurrentAssessmentPeriod, getSelectablePeriods, parseAssessmentPeriod, compareAssessmentPeriods, Cadence } from '../assessment-period';
 
 // Helper to create dates in local timezone (avoids UTC parsing issues)
 const createDate = (year: number, month: number, day: number) => new Date(year, month - 1, day);
@@ -183,6 +183,43 @@ describe('parseAssessmentPeriod', () => {
       expect(parseAssessmentPeriod('')).toBeNull();
       expect(parseAssessmentPeriod('abcd')).toBeNull();
     });
+  });
+});
+
+describe('getSelectablePeriods', () => {
+  it('includes the current period first for half-yearly cadence', () => {
+    const periods = getSelectablePeriods('half-yearly', 4, createDate(2026, 9, 22));
+    expect(periods[0]).toBe('2026 H2');
+  });
+
+  it('steps backward by half-year increments, including a previous period like H1 2026', () => {
+    const periods = getSelectablePeriods('half-yearly', 4, createDate(2026, 9, 22));
+    expect(periods).toEqual(['2026 H2', '2026 H1', '2025 H2', '2025 H1']);
+  });
+
+  it('steps backward by quarter for quarterly cadence', () => {
+    const periods = getSelectablePeriods('quarterly', 5, createDate(2026, 1, 15));
+    expect(periods).toEqual(['2026 Q1', '2025 Q4', '2025 Q3', '2025 Q2', '2025 Q1']);
+  });
+
+  it('steps backward by month for monthly cadence', () => {
+    const periods = getSelectablePeriods('monthly', 3, createDate(2026, 2, 1));
+    expect(periods).toEqual(['2026 Feb', '2026 Jan', '2025 Dec']);
+  });
+
+  it('steps backward by year for yearly cadence', () => {
+    const periods = getSelectablePeriods('yearly', 3, createDate(2026, 6, 1));
+    expect(periods).toEqual(['2026', '2025', '2024']);
+  });
+
+  it('defaults to 6 periods when count is not given', () => {
+    expect(getSelectablePeriods('half-yearly', undefined, createDate(2026, 9, 22))).toHaveLength(6);
+  });
+
+  it('every returned period parses as a valid assessment period', () => {
+    for (const period of getSelectablePeriods('quarterly', 8, createDate(2026, 9, 22))) {
+      expect(parseAssessmentPeriod(period)).not.toBeNull();
+    }
   });
 });
 

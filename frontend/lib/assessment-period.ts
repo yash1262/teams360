@@ -109,6 +109,35 @@ export function parseAssessmentPeriod(period: string): ParsedPeriod | null {
 }
 
 /**
+ * Build a list of selectable periods for manual override, most recent first.
+ * Always includes the current auto-detected period, followed by `count - 1`
+ * preceding periods for the given cadence (e.g., previous half-years).
+ *
+ * @param cadence - Team cadence
+ * @param count - Number of periods to return (default 6)
+ * @param referenceDate - Date to anchor "current" (defaults to now)
+ */
+export function getSelectablePeriods(cadence: Cadence, count = 6, referenceDate?: Date): string[] {
+  const base = referenceDate ?? new Date();
+  let year = base.getFullYear();
+  let month = base.getMonth(); // 0-indexed
+
+  const stepSize = cadence === 'monthly' ? 1 : cadence === 'quarterly' ? 3 : cadence === 'yearly' ? 12 : 6;
+
+  const periods: string[] = [];
+  for (let i = 0; i < count; i++) {
+    periods.push(getAssessmentPeriod(new Date(year, month, 1), cadence));
+    month -= stepSize;
+    while (month < 0) {
+      month += 12;
+      year -= 1;
+    }
+  }
+
+  return periods;
+}
+
+/**
  * Convert a parsed period to a numeric sort key for chronological ordering.
  */
 function periodSortKey(parsed: ParsedPeriod): number {
