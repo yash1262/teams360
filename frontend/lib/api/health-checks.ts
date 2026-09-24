@@ -144,6 +144,49 @@ export async function getTeamSubmissionStatus(
   return handleResponse<TeamSubmissionStatus>(response);
 }
 
+export interface SurveyEligibility {
+  eligible: boolean;
+  // Populated when eligible is false: 'duplicate' (same quarter already submitted) or
+  // 'consecutive_quarter' (Individual Survey only -- immediately adjacent to the last
+  // submission).
+  reason?: 'duplicate' | 'consecutive_quarter';
+  submittedPeriod?: string;
+  nextEligiblePeriod?: string;
+}
+
+/**
+ * Checks whether a survey can be submitted for the given assessment period before opening
+ * the survey form -- each survey type (and, for post-workshop, calendar quarter) can only
+ * be submitted once. Individual surveys are scoped to the user; post-workshop surveys are
+ * scoped to the team.
+ *
+ * @param params.surveyType 'individual' or 'post_workshop'
+ * @param params.assessmentPeriod Assessment period to check (e.g. "2026 Q1")
+ * @param params.teamId Required when surveyType is 'post_workshop'
+ * @param params.userId Required when surveyType is 'individual'
+ * @returns Eligibility result; when ineligible, includes the already-submitted period and
+ *          the next eligible one
+ */
+export async function checkSurveyEligibility(params: {
+  surveyType: 'individual' | 'post_workshop';
+  assessmentPeriod: string;
+  teamId?: string;
+  userId?: string;
+}): Promise<SurveyEligibility> {
+  const query = new URLSearchParams({
+    surveyType: params.surveyType,
+    assessmentPeriod: params.assessmentPeriod,
+  });
+  if (params.teamId) query.set('teamId', params.teamId);
+  if (params.userId) query.set('userId', params.userId);
+
+  const response = await apiRequest(
+    `${API_BASE_URL}/api/v1/health-checks/eligibility?${query.toString()}`
+  );
+
+  return handleResponse<SurveyEligibility>(response);
+}
+
 /**
  * Fetches all distinct assessment periods from the database
  *

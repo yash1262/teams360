@@ -3,10 +3,21 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+
+	"github.com/lib/pq"
 
 	"github.com/agopalakrishnan/teams360/backend/domain/healthcheck"
 )
+
+// uniqueViolationConstraints maps the Postgres partial-unique-index names enforcing the
+// quarter duplicate-submission rule to the survey type they guard, so a 23505 error from
+// Save() can be translated into a friendly healthcheck.DuplicateSubmissionError.
+var uniqueViolationConstraints = map[string]string{
+	"idx_unique_individual_quarter_submission":    healthcheck.SurveyTypeIndividual,
+	"idx_unique_post_workshop_quarter_submission": healthcheck.SurveyTypePostWorkshop,
+}
 
 // HealthCheckRepository implements the healthcheck.Repository interface
 type HealthCheckRepository struct {
@@ -26,6 +37,15 @@ func (r *HealthCheckRepository) Save(ctx context.Context, session *healthcheck.H
 		surveyType = healthcheck.SurveyTypeIndividual
 	}
 
+	// Derive the calendar quarter/year for the duplicate-submission unique indexes. Periods
+	// that don't match a known format (ok == false) store NULL, which Postgres unique
+	// indexes never treat as a conflict -- such sessions are simply not quarter-checked.
+	var quarterNumber, quarterYear sql.NullInt64
+	if quarter, year, ok := healthcheck.PeriodQuarter(session.AssessmentPeriod); ok {
+		quarterNumber = sql.NullInt64{Int64: int64(quarter), Valid: true}
+		quarterYear = sql.NullInt64{Int64: int64(year), Valid: true}
+	}
+
 	// Begin transaction for atomic save
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -36,8 +56,8 @@ func (r *HealthCheckRepository) Save(ctx context.Context, session *healthcheck.H
 	// Insert or update session
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO health_check_sessions (
-			id, team_id, user_id, date, assessment_period, survey_type, completed, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)
+			id, team_id, user_id, date, assessment_period, survey_type, completed, quarter_number, quarter_year, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP)
 		ON CONFLICT (id) DO UPDATE SET
 			team_id = EXCLUDED.team_id,
 			user_id = EXCLUDED.user_id,
@@ -45,10 +65,18 @@ func (r *HealthCheckRepository) Save(ctx context.Context, session *healthcheck.H
 			assessment_period = EXCLUDED.assessment_period,
 			survey_type = EXCLUDED.survey_type,
 			completed = EXCLUDED.completed,
+			quarter_number = EXCLUDED.quarter_number,
+			quarter_year = EXCLUDED.quarter_year,
 			updated_at = CURRENT_TIMESTAMP
-	`, session.ID, session.TeamID, session.UserID, session.Date, session.AssessmentPeriod, surveyType, session.Completed)
+	`, session.ID, session.TeamID, session.UserID, session.Date, session.AssessmentPeriod, surveyType, session.Completed, quarterNumber, quarterYear)
 
 	if err != nil {
+		var pqErr *pq.Error
+		if errors.As(err, &pqErr) && pqErr.Code == "23505" {
+			if constraintSurveyType, known := uniqueViolationConstraints[pqErr.Constraint]; known {
+				return healthcheck.NewDuplicateSubmissionError(constraintSurveyType, session.AssessmentPeriod)
+			}
+		}
 		return fmt.Errorf("failed to save session: %w", err)
 	}
 
@@ -479,6 +507,66 @@ func (r *HealthCheckRepository) GetTeamSubmissionStatus(ctx context.Context, tea
 		AllSubmitted:       allSubmitted,
 		PostWorkshopExists: postWorkshopExists,
 	}, nil
+}
+
+// FindQuarterSubmission returns the existing completed submission (if any) matching the
+// given scope for the same calendar quarter/year, or nil if none exists. Scoping:
+//   - individual:    matches by UserID only (a different user's submission never conflicts).
+//   - post_workshop: matches by TeamID only (one workshop consensus per team per quarter).
+func (r *HealthCheckRepository) FindQuarterSubmission(ctx context.Context, query healthcheck.QuarterSubmissionQuery) (*healthcheck.HealthCheckSession, error) {
+	var scopeColumn, scopeValue string
+	if query.SurveyType == healthcheck.SurveyTypePostWorkshop {
+		scopeColumn, scopeValue = "team_id", query.TeamID
+	} else {
+		scopeColumn, scopeValue = "user_id", query.UserID
+	}
+
+	var session healthcheck.HealthCheckSession
+	err := r.db.QueryRowContext(ctx, fmt.Sprintf(`
+		SELECT id, team_id, user_id, date, assessment_period, survey_type, completed
+		FROM health_check_sessions
+		WHERE %s = $1 AND survey_type = $2 AND quarter_number = $3 AND quarter_year = $4 AND completed = true
+		ORDER BY date DESC
+		LIMIT 1
+	`, scopeColumn), scopeValue, query.SurveyType, query.Quarter, query.Year).Scan(
+		&session.ID, &session.TeamID, &session.UserID, &session.Date,
+		&session.AssessmentPeriod, &session.SurveyType, &session.Completed,
+	)
+
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to query quarter submission: %w", err)
+	}
+
+	return &session, nil
+}
+
+// FindLatestIndividualSubmission returns the user's most recent completed Individual Survey
+// submission (by calendar quarter/year), or nil if the user has never submitted one.
+func (r *HealthCheckRepository) FindLatestIndividualSubmission(ctx context.Context, userID string) (*healthcheck.HealthCheckSession, error) {
+	var session healthcheck.HealthCheckSession
+	err := r.db.QueryRowContext(ctx, `
+		SELECT id, team_id, user_id, date, assessment_period, survey_type, completed
+		FROM health_check_sessions
+		WHERE user_id = $1 AND survey_type = $2 AND completed = true
+		  AND quarter_number IS NOT NULL AND quarter_year IS NOT NULL
+		ORDER BY quarter_year DESC, quarter_number DESC, date DESC
+		LIMIT 1
+	`, userID, healthcheck.SurveyTypeIndividual).Scan(
+		&session.ID, &session.TeamID, &session.UserID, &session.Date,
+		&session.AssessmentPeriod, &session.SurveyType, &session.Completed,
+	)
+
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to query latest individual submission: %w", err)
+	}
+
+	return &session, nil
 }
 
 // Delete removes a session and its responses (cascade handled by DB)

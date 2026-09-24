@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -492,4 +493,357 @@ var _ = Describe("Health Check API", func() {
 			})
 		})
 	})
+
+	Describe("POST /api/v1/health-checks - duplicate quarter prevention", func() {
+		submitPayload := func(payload map[string]interface{}) *httptest.ResponseRecorder {
+			body, _ := json.Marshal(payload)
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/health-checks", bytes.NewBuffer(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+userToken)
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			return w
+		}
+
+		individualSubmission := func(userID, teamID, period string) map[string]interface{} {
+			return map[string]interface{}{
+				"teamId":           teamID,
+				"userId":           userID,
+				"date":             time.Now().Format(time.RFC3339),
+				"assessmentPeriod": period,
+				"surveyType":       "individual",
+				"responses": []map[string]interface{}{
+					{"dimensionId": "mission", "score": 3, "trend": "improving"},
+				},
+				"completed": true,
+			}
+		}
+
+		postWorkshopSubmission := func(userID, teamID, period string) map[string]interface{} {
+			s := individualSubmission(userID, teamID, period)
+			s["surveyType"] = "post_workshop"
+			return s
+		}
+
+		Context("individual survey", func() {
+			It("rejects a second submission by the same user for the same quarter with 409 Conflict", func() {
+				w1 := submitPayload(individualSubmission("dup-user-1", "team1", "2026 Q1"))
+				Expect(w1.Code).To(Equal(http.StatusCreated))
+
+				w2 := submitPayload(individualSubmission("dup-user-1", "team1", "2026 Q1"))
+				Expect(w2.Code).To(Equal(http.StatusConflict))
+
+				var response map[string]interface{}
+				Expect(json.Unmarshal(w2.Body.Bytes(), &response)).To(Succeed())
+				Expect(response["submittedPeriod"]).To(Equal("Q1 2026"))
+				Expect(response["nextEligiblePeriod"]).To(Equal("Q3 2026"))
+				Expect(response["message"]).To(ContainSubstring("Individual Survey"))
+				Expect(response["message"]).To(ContainSubstring("Q1 2026"))
+				Expect(response["message"]).To(ContainSubstring("Q3 2026"))
+			})
+
+			It("allows a second submission by a different user for the same quarter", func() {
+				w1 := submitPayload(individualSubmission("dup-user-2", "team1", "2026 Q1"))
+				Expect(w1.Code).To(Equal(http.StatusCreated))
+
+				w2 := submitPayload(individualSubmission("dup-user-3", "team1", "2026 Q1"))
+				Expect(w2.Code).To(Equal(http.StatusCreated))
+			})
+
+			It("allows the same user to submit again once the next eligible quarter arrives", func() {
+				w1 := submitPayload(individualSubmission("dup-user-4", "team1", "2026 Q1"))
+				Expect(w1.Code).To(Equal(http.StatusCreated))
+
+				w2 := submitPayload(individualSubmission("dup-user-4", "team1", "2026 Q3"))
+				Expect(w2.Code).To(Equal(http.StatusCreated))
+			})
+		})
+
+		Context("post-workshop survey", func() {
+			It("rejects a second submission for the same team and quarter with 409 Conflict, even from a different Team Lead", func() {
+				w1 := submitPayload(postWorkshopSubmission("lead-1", "dup-team-1", "2026 Q2"))
+				Expect(w1.Code).To(Equal(http.StatusCreated))
+
+				w2 := submitPayload(postWorkshopSubmission("lead-2", "dup-team-1", "2026 Q2"))
+				Expect(w2.Code).To(Equal(http.StatusConflict))
+
+				var response map[string]interface{}
+				Expect(json.Unmarshal(w2.Body.Bytes(), &response)).To(Succeed())
+				Expect(response["submittedPeriod"]).To(Equal("Q2 2026"))
+				Expect(response["nextEligiblePeriod"]).To(Equal("Q4 2026"))
+				Expect(response["message"]).To(ContainSubstring("Post-Workshop Survey"))
+			})
+
+			It("allows a different team to submit for the same quarter", func() {
+				w1 := submitPayload(postWorkshopSubmission("lead-1", "dup-team-2", "2026 Q2"))
+				Expect(w1.Code).To(Equal(http.StatusCreated))
+
+				w2 := submitPayload(postWorkshopSubmission("lead-1", "dup-team-3", "2026 Q2"))
+				Expect(w2.Code).To(Equal(http.StatusCreated))
+			})
+		})
+
+		Context("separation between survey types", func() {
+			It("does not let a post-workshop submission block an individual submission for the same user/team/quarter, or vice versa", func() {
+				w1 := submitPayload(individualSubmission("dup-user-5", "dup-team-4", "2026 Q4"))
+				Expect(w1.Code).To(Equal(http.StatusCreated))
+
+				w2 := submitPayload(postWorkshopSubmission("dup-user-5", "dup-team-4", "2026 Q4"))
+				Expect(w2.Code).To(Equal(http.StatusCreated))
+			})
+		})
+
+		Context("concurrent submission attempts", func() {
+			It("allows exactly one of two concurrent submissions for the same user/quarter to succeed", func() {
+				const attempts = 5
+				codes := make(chan int, attempts)
+
+				var wg sync.WaitGroup
+				for i := 0; i < attempts; i++ {
+					wg.Add(1)
+					go func() {
+						defer GinkgoRecover()
+						defer wg.Done()
+						w := submitPayload(individualSubmission("dup-user-concurrent", "team1", "2026 Q1"))
+						codes <- w.Code
+					}()
+				}
+				wg.Wait()
+				close(codes)
+
+				created, conflict := 0, 0
+				for code := range codes {
+					switch code {
+					case http.StatusCreated:
+						created++
+					case http.StatusConflict:
+						conflict++
+					}
+				}
+				Expect(created).To(Equal(1), "exactly one concurrent submission should be accepted")
+				Expect(conflict).To(Equal(attempts-1), "every other concurrent submission should be rejected as a duplicate")
+			})
+		})
+	})
+
+	Describe("GET /api/v1/health-checks/eligibility", func() {
+		Context("individual survey", func() {
+			It("reports eligible when no prior submission exists for the quarter", func() {
+				req := httptest.NewRequest(http.MethodGet,
+					"/api/v1/health-checks/eligibility?surveyType=individual&userId=elig-user-1&assessmentPeriod=2026+Q1", nil)
+				req.Header.Set("Authorization", "Bearer "+userToken)
+				w := httptest.NewRecorder()
+				router.ServeHTTP(w, req)
+
+				Expect(w.Code).To(Equal(http.StatusOK))
+				var response map[string]interface{}
+				Expect(json.Unmarshal(w.Body.Bytes(), &response)).To(Succeed())
+				Expect(response["eligible"]).To(BeTrue())
+			})
+
+			It("reports ineligible with the submitted and next-eligible periods after a submission", func() {
+				body, _ := json.Marshal(individualSubmissionPayload("elig-user-2", "team1", "2026 Q4"))
+				req := httptest.NewRequest(http.MethodPost, "/api/v1/health-checks", bytes.NewBuffer(body))
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("Authorization", "Bearer "+userToken)
+				w := httptest.NewRecorder()
+				router.ServeHTTP(w, req)
+				Expect(w.Code).To(Equal(http.StatusCreated))
+
+				req2 := httptest.NewRequest(http.MethodGet,
+					"/api/v1/health-checks/eligibility?surveyType=individual&userId=elig-user-2&assessmentPeriod=2026+Q4", nil)
+				req2.Header.Set("Authorization", "Bearer "+userToken)
+				w2 := httptest.NewRecorder()
+				router.ServeHTTP(w2, req2)
+
+				Expect(w2.Code).To(Equal(http.StatusOK))
+				var response map[string]interface{}
+				Expect(json.Unmarshal(w2.Body.Bytes(), &response)).To(Succeed())
+				Expect(response["eligible"]).To(BeFalse())
+				Expect(response["submittedPeriod"]).To(Equal("Q4 2026"))
+				Expect(response["nextEligiblePeriod"]).To(Equal("Q2 2027"))
+			})
+		})
+
+		Context("missing or invalid parameters", func() {
+			It("returns 400 when assessmentPeriod is missing", func() {
+				req := httptest.NewRequest(http.MethodGet,
+					"/api/v1/health-checks/eligibility?surveyType=individual&userId=elig-user-3", nil)
+				req.Header.Set("Authorization", "Bearer "+userToken)
+				w := httptest.NewRecorder()
+				router.ServeHTTP(w, req)
+				Expect(w.Code).To(Equal(http.StatusBadRequest))
+			})
+
+			It("returns 400 when assessmentPeriod is not a recognized format", func() {
+				req := httptest.NewRequest(http.MethodGet,
+					"/api/v1/health-checks/eligibility?surveyType=individual&userId=elig-user-4&assessmentPeriod=not-a-period", nil)
+				req.Header.Set("Authorization", "Bearer "+userToken)
+				w := httptest.NewRecorder()
+				router.ServeHTTP(w, req)
+				Expect(w.Code).To(Equal(http.StatusBadRequest))
+			})
+
+			It("returns 400 when teamId is missing for a post_workshop check", func() {
+				req := httptest.NewRequest(http.MethodGet,
+					"/api/v1/health-checks/eligibility?surveyType=post_workshop&assessmentPeriod=2026+Q1", nil)
+				req.Header.Set("Authorization", "Bearer "+userToken)
+				w := httptest.NewRecorder()
+				router.ServeHTTP(w, req)
+				Expect(w.Code).To(Equal(http.StatusBadRequest))
+			})
+
+			It("returns 400 when userId is missing for an individual check", func() {
+				req := httptest.NewRequest(http.MethodGet,
+					"/api/v1/health-checks/eligibility?surveyType=individual&assessmentPeriod=2026+Q1", nil)
+				req.Header.Set("Authorization", "Bearer "+userToken)
+				w := httptest.NewRecorder()
+				router.ServeHTTP(w, req)
+				Expect(w.Code).To(Equal(http.StatusBadRequest))
+			})
+		})
+	})
+
+	Describe("POST /api/v1/health-checks - consecutive quarter prevention (Individual Survey)", func() {
+		submitIndividual := func(userID, teamID, period string) *httptest.ResponseRecorder {
+			body, _ := json.Marshal(individualSubmissionPayload(userID, teamID, period))
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/health-checks", bytes.NewBuffer(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+userToken)
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			return w
+		}
+
+		DescribeTable("rejects a submission for the quarter immediately after the last one",
+			func(userID, from, to, wantSubmitted, wantNextEligible string) {
+				w1 := submitIndividual(userID, "team1", from)
+				Expect(w1.Code).To(Equal(http.StatusCreated))
+
+				w2 := submitIndividual(userID, "team1", to)
+				Expect(w2.Code).To(Equal(http.StatusConflict))
+
+				var response map[string]interface{}
+				Expect(json.Unmarshal(w2.Body.Bytes(), &response)).To(Succeed())
+				Expect(response["code"]).To(Equal("consecutive_quarter_submission"))
+				Expect(response["submittedPeriod"]).To(Equal(wantSubmitted))
+				Expect(response["nextEligiblePeriod"]).To(Equal(wantNextEligible))
+				Expect(response["message"]).To(ContainSubstring("consecutive quarters"))
+			},
+			Entry("Q1 to Q2", "consec-user-1", "2026 Q1", "2026 Q2", "Q1 2026", "Q3 2026"),
+			Entry("Q2 to Q3", "consec-user-2", "2026 Q2", "2026 Q3", "Q2 2026", "Q4 2026"),
+			Entry("Q3 to Q4", "consec-user-3", "2026 Q3", "2026 Q4", "Q3 2026", "Q1 2027"),
+			Entry("Q4 to Q1 of the following year", "consec-user-4", "2025 Q4", "2026 Q1", "Q4 2025", "Q2 2026"),
+		)
+
+		DescribeTable("allows a submission once at least one full quarter has been skipped",
+			func(userID, from, to string) {
+				w1 := submitIndividual(userID, "team1", from)
+				Expect(w1.Code).To(Equal(http.StatusCreated))
+
+				w2 := submitIndividual(userID, "team1", to)
+				Expect(w2.Code).To(Equal(http.StatusCreated))
+			},
+			Entry("Q1 to Q3", "consec-user-5", "2026 Q1", "2026 Q3"),
+			Entry("Q2 to Q4", "consec-user-6", "2026 Q2", "2026 Q4"),
+			Entry("Q1 to Q4", "consec-user-7", "2026 Q1", "2026 Q4"),
+			Entry("Q3 to Q1 of the following year", "consec-user-8", "2025 Q3", "2026 Q1"),
+			Entry("Q4 to Q2 of the following year", "consec-user-9", "2025 Q4", "2026 Q2"),
+		)
+
+		It("does not apply the consecutive-quarter restriction to Post-Workshop Survey submissions", func() {
+			body1, _ := json.Marshal(map[string]interface{}{
+				"teamId": "consec-team-1", "userId": "consec-lead-1",
+				"date": time.Now().Format(time.RFC3339), "assessmentPeriod": "2026 Q1",
+				"surveyType": "post_workshop",
+				"responses": []map[string]interface{}{
+					{"dimensionId": "mission", "score": 3, "trend": "improving"},
+				},
+				"completed": true,
+			})
+			req1 := httptest.NewRequest(http.MethodPost, "/api/v1/health-checks", bytes.NewBuffer(body1))
+			req1.Header.Set("Content-Type", "application/json")
+			req1.Header.Set("Authorization", "Bearer "+userToken)
+			w1 := httptest.NewRecorder()
+			router.ServeHTTP(w1, req1)
+			Expect(w1.Code).To(Equal(http.StatusCreated))
+
+			body2, _ := json.Marshal(map[string]interface{}{
+				"teamId": "consec-team-1", "userId": "consec-lead-1",
+				"date": time.Now().Format(time.RFC3339), "assessmentPeriod": "2026 Q2",
+				"surveyType": "post_workshop",
+				"responses": []map[string]interface{}{
+					{"dimensionId": "mission", "score": 3, "trend": "improving"},
+				},
+				"completed": true,
+			})
+			req2 := httptest.NewRequest(http.MethodPost, "/api/v1/health-checks", bytes.NewBuffer(body2))
+			req2.Header.Set("Content-Type", "application/json")
+			req2.Header.Set("Authorization", "Bearer "+userToken)
+			w2 := httptest.NewRecorder()
+			router.ServeHTTP(w2, req2)
+			Expect(w2.Code).To(Equal(http.StatusCreated))
+		})
+	})
+
+	Describe("GET /api/v1/health-checks/eligibility - consecutive quarter (Individual Survey)", func() {
+		It("reports ineligible with reason 'consecutive_quarter' after a submission for the immediately preceding quarter", func() {
+			w1 := httptest.NewRecorder()
+			body, _ := json.Marshal(individualSubmissionPayload("consec-elig-1", "team1", "2026 Q1"))
+			req1 := httptest.NewRequest(http.MethodPost, "/api/v1/health-checks", bytes.NewBuffer(body))
+			req1.Header.Set("Content-Type", "application/json")
+			req1.Header.Set("Authorization", "Bearer "+userToken)
+			router.ServeHTTP(w1, req1)
+			Expect(w1.Code).To(Equal(http.StatusCreated))
+
+			req2 := httptest.NewRequest(http.MethodGet,
+				"/api/v1/health-checks/eligibility?surveyType=individual&userId=consec-elig-1&assessmentPeriod=2026+Q2", nil)
+			req2.Header.Set("Authorization", "Bearer "+userToken)
+			w2 := httptest.NewRecorder()
+			router.ServeHTTP(w2, req2)
+
+			Expect(w2.Code).To(Equal(http.StatusOK))
+			var response map[string]interface{}
+			Expect(json.Unmarshal(w2.Body.Bytes(), &response)).To(Succeed())
+			Expect(response["eligible"]).To(BeFalse())
+			Expect(response["reason"]).To(Equal("consecutive_quarter"))
+			Expect(response["submittedPeriod"]).To(Equal("Q1 2026"))
+			Expect(response["nextEligiblePeriod"]).To(Equal("Q3 2026"))
+		})
+
+		It("reports eligible for a quarter that skips at least one full quarter", func() {
+			w1 := httptest.NewRecorder()
+			body, _ := json.Marshal(individualSubmissionPayload("consec-elig-2", "team1", "2026 Q1"))
+			req1 := httptest.NewRequest(http.MethodPost, "/api/v1/health-checks", bytes.NewBuffer(body))
+			req1.Header.Set("Content-Type", "application/json")
+			req1.Header.Set("Authorization", "Bearer "+userToken)
+			router.ServeHTTP(w1, req1)
+			Expect(w1.Code).To(Equal(http.StatusCreated))
+
+			req2 := httptest.NewRequest(http.MethodGet,
+				"/api/v1/health-checks/eligibility?surveyType=individual&userId=consec-elig-2&assessmentPeriod=2026+Q3", nil)
+			req2.Header.Set("Authorization", "Bearer "+userToken)
+			w2 := httptest.NewRecorder()
+			router.ServeHTTP(w2, req2)
+
+			Expect(w2.Code).To(Equal(http.StatusOK))
+			var response map[string]interface{}
+			Expect(json.Unmarshal(w2.Body.Bytes(), &response)).To(Succeed())
+			Expect(response["eligible"]).To(BeTrue())
+		})
+	})
 })
+
+func individualSubmissionPayload(userID, teamID, period string) map[string]interface{} {
+	return map[string]interface{}{
+		"teamId":           teamID,
+		"userId":           userID,
+		"date":             time.Now().Format(time.RFC3339),
+		"assessmentPeriod": period,
+		"surveyType":       "individual",
+		"responses": []map[string]interface{}{
+			{"dimensionId": "mission", "score": 3, "trend": "improving"},
+		},
+		"completed": true,
+	}
+}
