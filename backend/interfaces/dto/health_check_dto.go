@@ -78,4 +78,21 @@ type ErrorResponse struct {
 	Error   string `json:"error"`
 	Message string `json:"message,omitempty"`
 	Code    string `json:"code,omitempty"`
+	// SubmittedPeriod and NextEligiblePeriod are populated for duplicate-submission (409)
+	// errors, e.g. "Q1 2026" and "Q3 2026", so the frontend can render them without
+	// re-parsing the error message.
+	SubmittedPeriod    string `json:"submittedPeriod,omitempty"`
+	NextEligiblePeriod string `json:"nextEligiblePeriod,omitempty"`
+}
+
+// SurveyEligibilityResponse represents the result of a pre-submission duplicate/consecutive
+// quarter check.
+type SurveyEligibilityResponse struct {
+	Eligible bool `json:"eligible"`
+	// Reason is populated when Eligible is false: "duplicate" (same quarter already
+	// submitted) or "consecutive_quarter" (Individual Survey only -- immediately adjacent to
+	// the last submission).
+	Reason             string `json:"reason,omitempty"`
+	SubmittedPeriod    string `json:"submittedPeriod,omitempty"`
+	NextEligiblePeriod string `json:"nextEligiblePeriod,omitempty"`
 }

@@ -2,6 +2,7 @@ package v1
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -145,6 +146,34 @@ func (h *HealthCheckHandler) SubmitHealthCheck(c *gin.Context) {
 	session, err := h.submitHandler.Handle(cmd)
 	if err != nil {
 		telemetry.SetSpanError(span, err)
+
+		var dupErr *healthcheck.DuplicateSubmissionError
+		if errors.As(err, &dupErr) {
+			log.WithField("team_id", req.TeamID).WithField("survey_type", dupErr.SurveyType).
+				Warn("rejected duplicate health check submission")
+			c.JSON(http.StatusConflict, dto.ErrorResponse{
+				Error:              "Duplicate submission",
+				Message:            dupErr.Error(),
+				Code:               "duplicate_submission",
+				SubmittedPeriod:    dupErr.SubmittedPeriod,
+				NextEligiblePeriod: dupErr.NextEligiblePeriod,
+			})
+			return
+		}
+
+		var consecErr *healthcheck.ConsecutiveQuarterError
+		if errors.As(err, &consecErr) {
+			log.WithField("team_id", req.TeamID).Warn("rejected consecutive-quarter health check submission")
+			c.JSON(http.StatusConflict, dto.ErrorResponse{
+				Error:              "Consecutive quarter submission",
+				Message:            consecErr.Error(),
+				Code:               "consecutive_quarter_submission",
+				SubmittedPeriod:    consecErr.LastSubmittedPeriod,
+				NextEligiblePeriod: consecErr.NextEligiblePeriod,
+			})
+			return
+		}
+
 		log.WithError(err).WithField("team_id", req.TeamID).Warn("failed to submit health check")
 		c.JSON(http.StatusBadRequest, dto.ErrorResponse{
 			Error:   "Failed to submit health check",
@@ -367,6 +396,108 @@ func (h *HealthCheckHandler) GetTeamSubmissionStatus(c *gin.Context) {
 		AllSubmitted:       status.AllSubmitted,
 		PostWorkshopExists: status.PostWorkshopExists,
 	})
+}
+
+// CheckSurveyEligibility handles GET /api/v1/health-checks/eligibility
+//
+// Pre-submission check used by the frontend before opening a survey: given a survey type,
+// assessment period, and the relevant scope (teamId for post_workshop, userId for
+// individual), reports whether that calendar quarter is still eligible or was already
+// submitted -- and if so, when the next eligible quarter is.
+func (h *HealthCheckHandler) CheckSurveyEligibility(c *gin.Context) {
+	ctx := c.Request.Context()
+
+	surveyType := c.Query("surveyType")
+	if surveyType == "" {
+		surveyType = healthcheck.SurveyTypeIndividual
+	}
+	if surveyType != healthcheck.SurveyTypeIndividual && surveyType != healthcheck.SurveyTypePostWorkshop {
+		c.JSON(http.StatusBadRequest, dto.ErrorResponse{
+			Error:   "Invalid surveyType",
+			Message: "surveyType must be 'individual' or 'post_workshop'",
+		})
+		return
+	}
+
+	assessmentPeriod := c.Query("assessmentPeriod")
+	quarter, year, ok := healthcheck.PeriodQuarter(assessmentPeriod)
+	if !ok {
+		c.JSON(http.StatusBadRequest, dto.ErrorResponse{
+			Error:   "Invalid assessmentPeriod",
+			Message: "assessmentPeriod is required and must be a recognized assessment-period format",
+		})
+		return
+	}
+
+	teamID := c.Query("teamId")
+	userID := c.Query("userId")
+	if surveyType == healthcheck.SurveyTypePostWorkshop && teamID == "" {
+		c.JSON(http.StatusBadRequest, dto.ErrorResponse{
+			Error:   "Missing teamId",
+			Message: "teamId is required when surveyType is 'post_workshop'",
+		})
+		return
+	}
+	if surveyType == healthcheck.SurveyTypeIndividual && userID == "" {
+		c.JSON(http.StatusBadRequest, dto.ErrorResponse{
+			Error:   "Missing userId",
+			Message: "userId is required when surveyType is 'individual'",
+		})
+		return
+	}
+
+	existing, err := h.repository.FindQuarterSubmission(ctx, healthcheck.QuarterSubmissionQuery{
+		SurveyType: surveyType,
+		TeamID:     teamID,
+		UserID:     userID,
+		Quarter:    quarter,
+		Year:       year,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, dto.ErrorResponse{
+			Error:   "Failed to check survey eligibility",
+			Message: err.Error(),
+		})
+		return
+	}
+
+	if existing != nil {
+		dupErr := healthcheck.NewDuplicateSubmissionError(surveyType, assessmentPeriod)
+		c.JSON(http.StatusOK, dto.SurveyEligibilityResponse{
+			Eligible:           false,
+			Reason:             "duplicate",
+			SubmittedPeriod:    dupErr.SubmittedPeriod,
+			NextEligiblePeriod: dupErr.NextEligiblePeriod,
+		})
+		return
+	}
+
+	// The consecutive-quarter restriction only applies to Individual Survey submissions.
+	if surveyType == healthcheck.SurveyTypeIndividual {
+		latest, err := h.repository.FindLatestIndividualSubmission(ctx, userID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, dto.ErrorResponse{
+				Error:   "Failed to check survey eligibility",
+				Message: err.Error(),
+			})
+			return
+		}
+		if latest != nil {
+			if lastQuarter, lastYear, lastOK := healthcheck.PeriodQuarter(latest.AssessmentPeriod); lastOK &&
+				healthcheck.IsConsecutiveQuarter(lastQuarter, lastYear, quarter, year) {
+				consecErr := healthcheck.NewConsecutiveQuarterError(lastQuarter, lastYear)
+				c.JSON(http.StatusOK, dto.SurveyEligibilityResponse{
+					Eligible:           false,
+					Reason:             "consecutive_quarter",
+					SubmittedPeriod:    consecErr.LastSubmittedPeriod,
+					NextEligiblePeriod: consecErr.NextEligiblePeriod,
+				})
+				return
+			}
+		}
+	}
+
+	c.JSON(http.StatusOK, dto.SurveyEligibilityResponse{Eligible: true})
 }
 
 // GetAssessmentPeriods handles GET /api/v1/assessment-periods

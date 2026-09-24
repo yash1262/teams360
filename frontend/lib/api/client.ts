@@ -16,6 +16,9 @@ export interface APIError {
   error: string;
   message: string;
   code?: string;
+  // Populated on duplicate-submission (409) errors, e.g. "Q1 2026" / "Q3 2026".
+  submittedPeriod?: string;
+  nextEligiblePeriod?: string;
 }
 
 /**

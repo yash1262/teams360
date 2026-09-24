@@ -1,6 +1,9 @@
 package healthcheck
 
-import "context"
+import (
+	"context"
+	"fmt"
+)
 
 // Survey type constants
 const (
@@ -49,6 +52,85 @@ type TeamSubmissionStatus struct {
 	PostWorkshopExists bool   `json:"postWorkshopExists"`
 }
 
+// QuarterSubmissionQuery looks up an existing completed submission for the same
+// calendar quarter/year as a target assessment period, scoped by survey type:
+//   - individual:   scoped to UserID only (a different user's submission never blocks).
+//   - post_workshop: scoped to TeamID only (one workshop consensus per team per quarter).
+type QuarterSubmissionQuery struct {
+	SurveyType string
+	TeamID     string // required when SurveyType == SurveyTypePostWorkshop
+	UserID     string // required when SurveyType == SurveyTypeIndividual
+	Quarter    int
+	Year       int
+}
+
+// DuplicateSubmissionError indicates a survey was already submitted for the same
+// calendar quarter/year as the requested assessment period.
+type DuplicateSubmissionError struct {
+	SurveyType         string
+	SubmittedPeriod    string
+	NextEligiblePeriod string
+}
+
+func (e *DuplicateSubmissionError) Error() string {
+	return fmt.Sprintf(
+		"You have already submitted the %s for %s. Your next submission will be available in %s.",
+		SurveyTypeLabel(e.SurveyType), e.SubmittedPeriod, e.NextEligiblePeriod,
+	)
+}
+
+// ConsecutiveQuarterError indicates an Individual Survey submission was attempted for the
+// calendar quarter immediately adjacent to the user's last completed Individual Survey
+// submission. The rule requires at least one full quarter to be skipped between submissions.
+type ConsecutiveQuarterError struct {
+	LastSubmittedPeriod string
+	NextEligiblePeriod  string
+}
+
+func (e *ConsecutiveQuarterError) Error() string {
+	return fmt.Sprintf(
+		"You cannot submit the survey in consecutive quarters. Your next eligible submission will be available in %s.",
+		e.NextEligiblePeriod,
+	)
+}
+
+// NewConsecutiveQuarterError builds a ConsecutiveQuarterError from the quarter/year of the
+// user's last Individual Survey submission, computing the next eligible quarter from it.
+func NewConsecutiveQuarterError(lastQuarter, lastYear int) *ConsecutiveQuarterError {
+	nextQuarter, nextYear := NextEligibleQuarter(lastQuarter, lastYear)
+	return &ConsecutiveQuarterError{
+		LastSubmittedPeriod: FormatQuarterPeriod(lastQuarter, lastYear),
+		NextEligiblePeriod:  FormatQuarterPeriod(nextQuarter, nextYear),
+	}
+}
+
+// SurveyTypeLabel renders a survey type constant as a user-facing label.
+func SurveyTypeLabel(surveyType string) string {
+	if surveyType == SurveyTypePostWorkshop {
+		return "Post-Workshop Survey"
+	}
+	return "Individual Survey"
+}
+
+// NewDuplicateSubmissionError builds a DuplicateSubmissionError for the given survey type
+// and the assessment period the caller just tried (and failed) to submit for. Both the
+// submitted and next-eligible periods are rendered in "Qn YYYY" form (regardless of the
+// team's actual cadence label) since the duplicate-submission rule is quarter-based.
+func NewDuplicateSubmissionError(surveyType string, assessmentPeriod string) *DuplicateSubmissionError {
+	submitted := assessmentPeriod
+	next := assessmentPeriod
+	if quarter, year, ok := PeriodQuarter(assessmentPeriod); ok {
+		submitted = FormatQuarterPeriod(quarter, year)
+		nextQuarter, nextYear := NextEligibleQuarter(quarter, year)
+		next = FormatQuarterPeriod(nextQuarter, nextYear)
+	}
+	return &DuplicateSubmissionError{
+		SurveyType:         surveyType,
+		SubmittedPeriod:    submitted,
+		NextEligiblePeriod: next,
+	}
+}
+
 // DimensionSummary represents aggregated dimension health
 type DimensionSummary struct {
 	DimensionID   string  `json:"dimensionId"`
@@ -74,4 +156,14 @@ type Repository interface {
 
 	// FindDistinctAssessmentPeriods returns all unique assessment periods from submitted sessions
 	FindDistinctAssessmentPeriods(ctx context.Context) ([]string, error)
+
+	// FindQuarterSubmission returns the existing completed submission (if any) matching the
+	// given scope for the same calendar quarter/year, or nil if none exists.
+	FindQuarterSubmission(ctx context.Context, query QuarterSubmissionQuery) (*HealthCheckSession, error)
+
+	// FindLatestIndividualSubmission returns the user's most recent completed Individual
+	// Survey submission (by calendar quarter/year), or nil if the user has never submitted
+	// one. Used to enforce the consecutive-quarter submission restriction, which depends on
+	// the user's most recent submission regardless of which quarter it targeted.
+	FindLatestIndividualSubmission(ctx context.Context, userID string) (*HealthCheckSession, error)
 }

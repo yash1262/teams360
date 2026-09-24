@@ -58,6 +58,45 @@ func (h *SubmitHealthCheckHandler) Handle(cmd SubmitHealthCheckCommand) (*health
 		surveyType = healthcheck.SurveyTypeIndividual
 	}
 
+	// Reject a duplicate submission for the same calendar quarter before writing anything.
+	// This is a friendly pre-check; the database's partial unique indexes (see the
+	// "quarter duplicate prevention" migration) are the authoritative, race-safe guard
+	// against two concurrent requests both passing this check.
+	if quarter, year, ok := healthcheck.PeriodQuarter(cmd.AssessmentPeriod); ok && cmd.Completed {
+		existing, err := h.repository.FindQuarterSubmission(context.Background(), healthcheck.QuarterSubmissionQuery{
+			SurveyType: surveyType,
+			TeamID:     cmd.TeamID,
+			UserID:     cmd.UserID,
+			Quarter:    quarter,
+			Year:       year,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to check for duplicate submission: %w", err)
+		}
+		if existing != nil {
+			return nil, healthcheck.NewDuplicateSubmissionError(surveyType, cmd.AssessmentPeriod)
+		}
+	}
+
+	// Reject an Individual Survey submission for the calendar quarter immediately adjacent to
+	// the user's last completed Individual Survey submission (the "no consecutive quarters"
+	// rule) -- at least one full quarter must be skipped between submissions. Post-Workshop
+	// submissions are scoped per team and are not subject to this rule.
+	if surveyType == healthcheck.SurveyTypeIndividual && cmd.Completed {
+		if quarter, year, ok := healthcheck.PeriodQuarter(cmd.AssessmentPeriod); ok {
+			latest, err := h.repository.FindLatestIndividualSubmission(context.Background(), cmd.UserID)
+			if err != nil {
+				return nil, fmt.Errorf("failed to check for consecutive-quarter submission: %w", err)
+			}
+			if latest != nil {
+				if lastQuarter, lastYear, lastOK := healthcheck.PeriodQuarter(latest.AssessmentPeriod); lastOK &&
+					healthcheck.IsConsecutiveQuarter(lastQuarter, lastYear, quarter, year) {
+					return nil, healthcheck.NewConsecutiveQuarterError(lastQuarter, lastYear)
+				}
+			}
+		}
+	}
+
 	// Convert command to domain model
 	session := &healthcheck.HealthCheckSession{
 		ID:               cmd.ID,
