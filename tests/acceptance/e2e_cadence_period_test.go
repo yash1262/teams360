@@ -89,7 +89,7 @@ var _ = Describe("E2E: Cadence-Driven Assessment Periods", Label("e2e"), func() 
 				err = surveyBtn.Click()
 				Expect(err).NotTo(HaveOccurred())
 
-				err = page.WaitForURL("**/survey", playwright.PageWaitForURLOptions{
+				err = page.WaitForURL("**/survey**", playwright.PageWaitForURLOptions{
 					Timeout: playwright.Float(5000),
 				})
 				Expect(err).NotTo(HaveOccurred())
@@ -142,11 +142,11 @@ var _ = Describe("E2E: Cadence-Driven Assessment Periods", Label("e2e"), func() 
 				Expect(err).NotTo(HaveOccurred())
 				err = submitButton.Click()
 				Expect(err).NotTo(HaveOccurred())
-
-				err = page.WaitForURL("**/home", playwright.PageWaitForURLOptions{
-					Timeout: playwright.Float(10000),
-				})
+				By("Confirming the submission in the confirmation modal")
+				err = page.Locator("[data-testid='submit-confirm-accept']").Click()
 				Expect(err).NotTo(HaveOccurred())
+
+				continueFromThankYou(page, "**/home")
 				dismissOnboardingIfVisible(page)
 
 				By("Verifying assessment period in database is in monthly format")
