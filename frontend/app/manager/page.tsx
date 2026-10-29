@@ -6,7 +6,7 @@ import { getCurrentUser, logout, authenticatedFetch, User } from '@/lib/auth';
 import { HEALTH_DIMENSIONS } from '@/lib/data';
 import { API_BASE_URL } from '@/lib/api/client';
 import { getAssessmentPeriods } from '@/lib/api/health-checks';
-import { formatPeriodLabel } from '@/lib/assessment-period';
+import { formatPeriodLabel, describePeriodOptions } from '@/lib/assessment-period';
 import { LogOut, Users, ChevronDown, AlertCircle, Activity, LineChart as LineChartIcon, CheckCircle, Clock, ClipboardList, TrendingUp, TrendingDown, Minus, LayoutGrid, Download, ListTodo } from 'lucide-react';
 import { RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import OnboardingModal from '@/components/OnboardingModal';
@@ -137,6 +137,11 @@ export default function ManagerPage() {
   const [subordinates, setSubordinates] = useState<Subordinate[]>([]);
 
   // Pre-group subordinates by parent and teams by ID for O(1) lookups in hierarchy tree
+  // Labels for the period filter. Historical quarter labels fold into half-years, so "2026 Q1"
+  // and "2026 Q2" would both read "H1 2026" while each still filters on its own raw period;
+  // describePeriodOptions keeps them apart.
+  const periodLabels = useMemo(() => describePeriodOptions(assessmentPeriodOptions), [assessmentPeriodOptions]);
+
   const childrenByParent = useMemo(() => {
     const map = new Map<string, Subordinate[]>();
     for (const sub of subordinates) {
@@ -499,7 +504,7 @@ export default function ManagerPage() {
             >
               <option value="">All Periods</option>
               {assessmentPeriodOptions.map((period) => (
-                <option key={period} value={period}>{formatPeriodLabel(period)}</option>
+                <option key={period} value={period}>{periodLabels[period] ?? formatPeriodLabel(period)}</option>
               ))}
             </select>
             {dashboardData && dashboardData.teams.length > 0 && (

@@ -553,6 +553,29 @@ var _ = Describe("Health Check API", func() {
 				w := submitPayload(individualSubmission("dup-user-past", "team1", pastPeriodRelativeToNow()))
 				Expect(w.Code).To(Equal(http.StatusBadRequest))
 			})
+
+			It("reports a previous-year period that was already submitted as a 409 duplicate with the next period, not a bare 400", func() {
+				past := pastPeriodRelativeToNow()
+				_, err := db.Exec(`
+					INSERT INTO health_check_sessions (id, team_id, user_id, date, assessment_period, survey_type, completed)
+					VALUES ('stale-dup-session', 'team1', 'dup-user-stale', '2020-01-15', $1, 'individual', true)
+				`, past)
+				Expect(err).NotTo(HaveOccurred())
+
+				w := submitPayload(individualSubmission("dup-user-stale", "team1", past))
+
+				Expect(w.Code).To(Equal(http.StatusConflict))
+				var response map[string]interface{}
+				Expect(json.Unmarshal(w.Body.Bytes(), &response)).To(Succeed())
+				Expect(response["code"]).To(Equal("duplicate"))
+				Expect(response["nextEligiblePeriod"]).To(Equal(healthcheck.NextEligiblePeriod([]string{past})))
+			})
+
+			It("rejects a completed submission with no supported assessment period with 400 Bad Request", func() {
+				payload := individualSubmissionPayload("dup-user-noperiod", "team1", "")
+				w := submitPayload(payload)
+				Expect(w.Code).To(Equal(http.StatusBadRequest))
+			})
 		})
 
 		Context("post-workshop survey", func() {
@@ -626,11 +649,19 @@ var _ = Describe("Health Check API", func() {
 	})
 
 	Describe("GET /api/v1/health-checks/eligibility", func() {
+		// The endpoint only answers about the caller's own submissions, or a team they belong to
+		// or lead (admins: anything), so each lookup needs a token for the scope it asks about.
+		tokenFor := func(userID, level string, teamIDs ...string) string {
+			pair, err := jwtService.GenerateTokenPair(context.Background(), userID, userID, userID+"@test.com", level, teamIDs)
+			Expect(err).NotTo(HaveOccurred())
+			return pair.AccessToken
+		}
+
 		Context("individual survey", func() {
 			It("reports eligible when no prior submission exists", func() {
 				req := httptest.NewRequest(http.MethodGet,
 					"/api/v1/health-checks/eligibility?surveyType=individual&userId=elig-user-1&assessmentPeriod="+url.QueryEscape(currentPeriod()), nil)
-				req.Header.Set("Authorization", "Bearer "+userToken)
+				req.Header.Set("Authorization", "Bearer "+tokenFor("elig-user-1", "level-5"))
 				w := httptest.NewRecorder()
 				router.ServeHTTP(w, req)
 
@@ -652,7 +683,7 @@ var _ = Describe("Health Check API", func() {
 
 				req2 := httptest.NewRequest(http.MethodGet,
 					"/api/v1/health-checks/eligibility?surveyType=individual&userId=elig-user-2&assessmentPeriod="+url.QueryEscape(period), nil)
-				req2.Header.Set("Authorization", "Bearer "+userToken)
+				req2.Header.Set("Authorization", "Bearer "+tokenFor("elig-user-2", "level-5"))
 				w2 := httptest.NewRecorder()
 				router.ServeHTTP(w2, req2)
 
@@ -668,7 +699,7 @@ var _ = Describe("Health Check API", func() {
 			It("reports ineligible as a future period without touching persisted records", func() {
 				req := httptest.NewRequest(http.MethodGet,
 					"/api/v1/health-checks/eligibility?surveyType=individual&userId=elig-user-future&assessmentPeriod="+url.QueryEscape(futurePeriodRelativeToNow()), nil)
-				req.Header.Set("Authorization", "Bearer "+userToken)
+				req.Header.Set("Authorization", "Bearer "+tokenFor("elig-user-future", "level-5"))
 				w := httptest.NewRecorder()
 				router.ServeHTTP(w, req)
 
@@ -682,7 +713,7 @@ var _ = Describe("Health Check API", func() {
 			It("reports ineligible as a past period for a period from a previous year", func() {
 				req := httptest.NewRequest(http.MethodGet,
 					"/api/v1/health-checks/eligibility?surveyType=individual&userId=elig-user-past&assessmentPeriod="+url.QueryEscape(pastPeriodRelativeToNow()), nil)
-				req.Header.Set("Authorization", "Bearer "+userToken)
+				req.Header.Set("Authorization", "Bearer "+tokenFor("elig-user-past", "level-5"))
 				w := httptest.NewRecorder()
 				router.ServeHTTP(w, req)
 
@@ -694,11 +725,43 @@ var _ = Describe("Health Check API", func() {
 			})
 		})
 
+		Context("who may ask", func() {
+			get := func(token, query string) *httptest.ResponseRecorder {
+				req := httptest.NewRequest(http.MethodGet, "/api/v1/health-checks/eligibility?"+query, nil)
+				req.Header.Set("Authorization", "Bearer "+token)
+				w := httptest.NewRecorder()
+				router.ServeHTTP(w, req)
+				return w
+			}
+			period := url.QueryEscape(currentPeriod())
+
+			It("refuses to reveal another user's submissions", func() {
+				w := get(tokenFor("someone-else", "level-5"), "surveyType=individual&userId=elig-user-1&assessmentPeriod="+period)
+				Expect(w.Code).To(Equal(http.StatusForbidden))
+			})
+
+			It("refuses a team the caller does not belong to or lead", func() {
+				w := get(tokenFor("elig-member", "level-5", "team-a"), "surveyType=post_workshop&teamId=team-b&assessmentPeriod="+period)
+				Expect(w.Code).To(Equal(http.StatusForbidden))
+			})
+
+			It("answers for a team the caller belongs to or leads", func() {
+				w := get(tokenFor("elig-member", "level-5", "team-a"), "surveyType=post_workshop&teamId=team-a&assessmentPeriod="+period)
+				Expect(w.Code).To(Equal(http.StatusOK))
+			})
+
+			It("lets an admin ask about any user or team", func() {
+				admin := tokenFor("an-admin", "level-admin")
+				Expect(get(admin, "surveyType=individual&userId=elig-user-1&assessmentPeriod="+period).Code).To(Equal(http.StatusOK))
+				Expect(get(admin, "surveyType=post_workshop&teamId=team-b&assessmentPeriod="+period).Code).To(Equal(http.StatusOK))
+			})
+		})
+
 		Context("missing or invalid parameters", func() {
 			It("returns 400 when assessmentPeriod is missing", func() {
 				req := httptest.NewRequest(http.MethodGet,
 					"/api/v1/health-checks/eligibility?surveyType=individual&userId=elig-user-3", nil)
-				req.Header.Set("Authorization", "Bearer "+userToken)
+				req.Header.Set("Authorization", "Bearer "+tokenFor("elig-user-3", "level-5"))
 				w := httptest.NewRecorder()
 				router.ServeHTTP(w, req)
 				Expect(w.Code).To(Equal(http.StatusBadRequest))

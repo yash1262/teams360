@@ -223,8 +223,68 @@ func TestCheckPeriodEligibility(t *testing.T) {
 		},
 		{
 			name:   "an unrecognized period format is reported distinctly",
-			period: "2026 Mar", now: "2026-03-15", submittedPeriods: nil,
+			period: "March 2026", now: "2026-03-15", submittedPeriods: nil,
 			want: PeriodReasonInvalidFormat,
+		},
+		{
+			name:   "an empty period is invalid",
+			period: "", now: "2026-03-15", submittedPeriods: nil,
+			want: PeriodReasonInvalidFormat,
+		},
+		{
+			name:   "an impossible quarter is invalid",
+			period: "2026 Q5", now: "2026-03-15", submittedPeriods: nil,
+			want: PeriodReasonInvalidFormat,
+		},
+		{
+			name:   "monthly: the current month is open",
+			period: "2026 Mar", now: "2026-03-15", submittedPeriods: nil,
+			want: PeriodEligible,
+		},
+		{
+			name:   "monthly: a later month is not open yet",
+			period: "2026 Apr", now: "2026-03-15", submittedPeriods: nil,
+			want: PeriodReasonFuture,
+		},
+		{
+			name:   "monthly: an earlier month is closed",
+			period: "2026 Feb", now: "2026-03-15", submittedPeriods: nil,
+			want: PeriodReasonPast,
+		},
+		{
+			name:   "monthly: the same month again is a duplicate",
+			period: "2026 Mar", now: "2026-03-15", submittedPeriods: []string{"2026 Mar"},
+			want: PeriodReasonDuplicate,
+		},
+		{
+			name:   "monthly: a submitted half-year does not block a month",
+			period: "2026 Mar", now: "2026-03-15", submittedPeriods: []string{"2026 H1"},
+			want: PeriodEligible,
+		},
+		{
+			name:   "yearly: the current year is open",
+			period: "2026", now: "2026-03-15", submittedPeriods: nil,
+			want: PeriodEligible,
+		},
+		{
+			name:   "yearly: next year is not open yet",
+			period: "2027", now: "2026-03-15", submittedPeriods: nil,
+			want: PeriodReasonFuture,
+		},
+		{
+			name:   "yearly: last year is closed",
+			period: "2025", now: "2026-03-15", submittedPeriods: nil,
+			want: PeriodReasonPast,
+		},
+		{
+			name:   "yearly: the same year again is a duplicate",
+			period: "2026", now: "2026-03-15", submittedPeriods: []string{"2026"},
+			want: PeriodReasonDuplicate,
+		},
+		{
+			name:   "an old-style label for a submitted half-year is a duplicate of the new label",
+			period: "2026 Q2", now: "2026-03-15", submittedPeriods: []string{"2026 H1"},
+			want: PeriodReasonDuplicate,
 		},
 	}
 
@@ -259,6 +319,60 @@ func TestNextEligiblePeriod(t *testing.T) {
 			got := NextEligiblePeriod(tc.submittedPeriods)
 			if got != tc.want {
 				t.Errorf("NextEligiblePeriod(%v) = %q, want %q", tc.submittedPeriods, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCanonicalPeriod(t *testing.T) {
+	cases := []struct {
+		in     string
+		want   string
+		wantOK bool
+	}{
+		{"2026 H1", "2026 H1", true},
+		{"2026 H2", "2026 H2", true},
+		{"2026 Q1", "2026 H1", true},
+		{"2026 Q2", "2026 H1", true},
+		{"2026 Q3", "2026 H2", true},
+		{"2026 Q4", "2026 H2", true},
+		{"2025 - 1st Half", "2025 H2", true}, // Jul-Dec 2025
+		{"2025 - 2nd Half", "2026 H1", true}, // Jan-Jun 2026
+		{"2026 Mar", "2026 Mar", true},
+		{"2026", "2026", true},
+		{"", "", false},
+		{"H1 2026", "", false}, // the display form is not a stored period
+		{"2026 Q5", "", false},
+		{"2026 March", "", false},
+		{"26", "", false},
+	}
+	for _, tc := range cases {
+		got, ok := CanonicalPeriod(tc.in)
+		if got != tc.want || ok != tc.wantOK {
+			t.Errorf("CanonicalPeriod(%q) = (%q, %v), want (%q, %v)", tc.in, got, ok, tc.want, tc.wantOK)
+		}
+	}
+}
+
+func TestNextEligiblePeriodAfter(t *testing.T) {
+	cases := []struct {
+		name       string
+		duplicated string
+		submitted  []string
+		want       string
+	}{
+		{"half-year H1 -> H2", "2026 H1", []string{"2026 H1"}, "H2 2026"},
+		{"half-year H2 -> next year's H1", "2026 H2", []string{"2026 H2"}, "H1 2027"},
+		{"monthly", "2026 Mar", []string{"2026 Jan", "2026 Mar"}, "2026 Apr"},
+		{"monthly December rolls the year", "2026 Dec", []string{"2026 Dec"}, "2027 Jan"},
+		{"yearly", "2026", []string{"2025", "2026"}, "2027"},
+		{"nothing of that kind submitted", "2026 Mar", []string{"2026 H1"}, ""},
+		{"an unrecognized period falls back to the half-year sequence", "H1 2026", []string{"2026 H1"}, "H2 2026"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := NextEligiblePeriodAfter(tc.duplicated, tc.submitted); got != tc.want {
+				t.Errorf("NextEligiblePeriodAfter(%q, %v) = %q, want %q", tc.duplicated, tc.submitted, got, tc.want)
 			}
 		})
 	}

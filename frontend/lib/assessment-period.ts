@@ -142,6 +142,26 @@ export function getSelectablePeriods(cadence: Cadence, count = 6, referenceDate?
 }
 
 /**
+ * The selectable periods that can still be started: those in the current year.
+ *
+ * `getSelectablePeriods` walks back several years for history dropdowns, but the backend only
+ * ever treats the current year's periods as open for a new submission (see
+ * healthcheck.CheckPeriodEligibility) -- anything older is rejected as "past_period" whether or
+ * not it was ever submitted. Offering those older periods in a "take a survey" picker only sets
+ * the user up to choose something that can never succeed.
+ *
+ * @param cadence - Team cadence
+ * @param referenceDate - Date to anchor "current" (defaults to now)
+ */
+export function getCurrentYearPeriods(cadence: Cadence, count = 6, referenceDate?: Date): string[] {
+  const currentYear = (referenceDate ?? new Date()).getFullYear();
+  return getSelectablePeriods(cadence, count, referenceDate).filter((period) => {
+    const parsed = parseAssessmentPeriod(period);
+    return parsed ? parsed.year >= currentYear : true;
+  });
+}
+
+/**
  * Render an assessment period as a user-facing label, in the dynamic format
  * `H1 <year>` / `H2 <year>`.
  *
@@ -174,6 +194,32 @@ export function formatPeriodLabel(period: string): string {
     case 'yearly':
       return period;
   }
+}
+
+/**
+ * Labels for a list of period options, keeping equivalent periods apart.
+ *
+ * `formatPeriodLabel` folds old quarter labels into half-years, so "2026 Q1" and "2026 Q2"
+ * both render as "H1 2026". In a dropdown that makes two options indistinguishable even though
+ * each one filters on its own raw period. Where two or more options share a label, the raw
+ * period is appended -- "H1 2026 (2026 Q1)" -- so the user can tell them apart and knows
+ * exactly which records a choice shows.
+ *
+ * @returns A map from each raw period to the label to display for it
+ */
+export function describePeriodOptions(periods: string[]): Record<string, string> {
+  const counts = new Map<string, number>();
+  for (const period of periods) {
+    const label = formatPeriodLabel(period);
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+
+  const labels: Record<string, string> = {};
+  for (const period of periods) {
+    const label = formatPeriodLabel(period);
+    labels[period] = (counts.get(label) ?? 0) > 1 && label !== period ? `${label} (${period})` : label;
+  }
+  return labels;
 }
 
 /**

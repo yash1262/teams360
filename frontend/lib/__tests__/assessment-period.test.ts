@@ -11,7 +11,7 @@
  * historical data, and always rendered to users as a safe H1/H2 label (see formatPeriodLabel).
  */
 
-import { getAssessmentPeriod, getCurrentAssessmentPeriod, getSelectablePeriods, parseAssessmentPeriod, compareAssessmentPeriods, formatPeriodLabel, Cadence } from '../assessment-period';
+import { getAssessmentPeriod, getCurrentAssessmentPeriod, getSelectablePeriods, getCurrentYearPeriods, describePeriodOptions, parseAssessmentPeriod, compareAssessmentPeriods, formatPeriodLabel, Cadence } from '../assessment-period';
 
 // Helper to create dates in local timezone (avoids UTC parsing issues)
 const createDate = (year: number, month: number, day: number) => new Date(year, month - 1, day);
@@ -274,3 +274,48 @@ describe('formatPeriodLabel', () => {
     expect(formatPeriodLabel('not-a-period')).toBe('not-a-period');
   });
 });
+
+describe('getCurrentYearPeriods', () => {
+  it('offers only this year\'s half-years: the backend rejects anything older as past_period', () => {
+    expect(getCurrentYearPeriods('half-yearly', 6, createDate(2026, 9, 22))).toEqual(['2026 H2', '2026 H1']);
+  });
+
+  it('offers only the current half-year in the first half of the year', () => {
+    expect(getCurrentYearPeriods('half-yearly', 6, createDate(2026, 1, 10))).toEqual(['2026 H1']);
+  });
+
+  it('keeps monthly periods to the current year', () => {
+    expect(getCurrentYearPeriods('monthly', 6, createDate(2026, 2, 10))).toEqual(['2026 Feb', '2026 Jan']);
+  });
+
+  it('keeps only the current year for a yearly cadence', () => {
+    expect(getCurrentYearPeriods('yearly', 6, createDate(2026, 6, 1))).toEqual(['2026']);
+  });
+});
+
+describe('describePeriodOptions', () => {
+  it('labels each period in the user-facing format when every label is distinct', () => {
+    expect(describePeriodOptions(['2026 H2', '2026 H1'])).toEqual({
+      '2026 H2': 'H2 2026',
+      '2026 H1': 'H1 2026',
+    });
+  });
+
+  it('keeps equivalent periods apart: "2026 Q1" and "2026 Q2" would both read "H1 2026"', () => {
+    const labels = describePeriodOptions(['2026 Q1', '2026 Q2', '2026 H2']);
+
+    expect(labels['2026 Q1']).toBe('H1 2026 (2026 Q1)');
+    expect(labels['2026 Q2']).toBe('H1 2026 (2026 Q2)');
+    expect(labels['2026 H2']).toBe('H2 2026');
+    expect(labels['2026 Q1']).not.toBe(labels['2026 Q2']);
+  });
+
+  it('does not repeat a period that is already its own label (monthly and yearly)', () => {
+    expect(describePeriodOptions(['2026 Mar', '2026'])).toEqual({ '2026 Mar': '2026 Mar', '2026': '2026' });
+  });
+
+  it('handles an empty list', () => {
+    expect(describePeriodOptions([])).toEqual({});
+  });
+});
+

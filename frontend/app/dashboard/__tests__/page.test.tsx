@@ -12,7 +12,7 @@
  *  - Cancel/close dismisses the modal without navigating.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import DashboardPage from '../page';
 
@@ -245,10 +245,11 @@ describe('Team Lead dashboard: assessment period selection modal', () => {
     expect(screen.queryByTestId('take-survey-period-select')).not.toBeInTheDocument();
   });
 
-  describe('six-month submission cooldown', () => {
+  describe('eligibility check before opening a survey', () => {
     it('shows the "already submitted" modal instead of opening the survey when Individual Survey is ineligible', async () => {
       checkSurveyEligibility.mockResolvedValue({
         eligible: false,
+        reason: 'duplicate',
         submittedPeriod: 'H1 2026',
         nextEligiblePeriod: 'H2 2026',
       });
@@ -270,6 +271,7 @@ describe('Team Lead dashboard: assessment period selection modal', () => {
     it('shows the "already submitted" modal instead of opening the survey when Post-Workshop Survey is ineligible', async () => {
       checkSurveyEligibility.mockResolvedValue({
         eligible: false,
+        reason: 'duplicate',
         submittedPeriod: 'H1 2026',
         nextEligiblePeriod: 'H2 2026',
       });
@@ -284,12 +286,16 @@ describe('Team Lead dashboard: assessment period selection modal', () => {
       expect(screen.getByTestId('duplicate-submission-message')).toHaveTextContent('Post-Workshop Survey');
       expect(screen.getByTestId('duplicate-submission-message')).toHaveTextContent('H1 2026');
       expect(screen.getByTestId('duplicate-submission-message')).toHaveTextContent('H2 2026');
+      // The survey belongs to the team, so another Team Lead can land here without having
+      // submitted anything themselves.
+      expect(screen.getByTestId('duplicate-submission-message')).toHaveTextContent('Your team has already submitted');
       expect(push).not.toHaveBeenCalled();
     });
 
     it('shows "Your next survey is scheduled for H1 <next year>" for the Individual Survey when the last submission was H2 (year rollover)', async () => {
       checkSurveyEligibility.mockResolvedValue({
         eligible: false,
+        reason: 'duplicate',
         submittedPeriod: 'H2 2026',
         nextEligiblePeriod: 'H1 2027',
       });
@@ -310,6 +316,7 @@ describe('Team Lead dashboard: assessment period selection modal', () => {
     it('shows "Your next survey is scheduled for H1 <next year>" for the Post-Workshop Survey when the last submission was H2 (year rollover)', async () => {
       checkSurveyEligibility.mockResolvedValue({
         eligible: false,
+        reason: 'duplicate',
         submittedPeriod: 'H2 2026',
         nextEligiblePeriod: 'H1 2027',
       });
@@ -343,6 +350,7 @@ describe('Team Lead dashboard: assessment period selection modal', () => {
     it('closes the duplicate-submission modal via the Close button', async () => {
       checkSurveyEligibility.mockResolvedValue({
         eligible: false,
+        reason: 'duplicate',
         submittedPeriod: 'H1 2026',
         nextEligiblePeriod: 'H2 2026',
       });
@@ -403,6 +411,73 @@ describe('Team Lead dashboard: assessment period selection modal', () => {
 
       await waitFor(() => expect(push).toHaveBeenCalledWith('/survey?team=team-1&period=2026+H2'));
       expect(screen.queryByTestId('duplicate-submission-modal')).not.toBeInTheDocument();
+    });
+
+    it.each(['future_period', 'past_period', 'invalid_period'])(
+      'says the period is not available, never "already submitted", when the reason is %s',
+      async (reason) => {
+        checkSurveyEligibility.mockResolvedValue({ eligible: false, reason });
+        const user = userEvent.setup({ delay: null });
+        render(<DashboardPage />);
+
+        await waitFor(() => expect(screen.getByTestId('take-survey-button')).toBeInTheDocument());
+        await user.click(screen.getByTestId('take-survey-button'));
+        await user.click(screen.getByTestId('period-selection-confirm-button'));
+
+        await waitFor(() => expect(screen.getByTestId('duplicate-submission-modal')).toBeInTheDocument());
+        const modal = screen.getByTestId('duplicate-submission-modal');
+        expect(modal).toHaveTextContent('Period Not Available');
+        expect(modal).toHaveTextContent('is not open for submission');
+        expect(modal).not.toHaveTextContent('already submitted');
+        expect(modal).not.toHaveTextContent('scheduled for');
+        expect(push).not.toHaveBeenCalled();
+      },
+    );
+
+    it('shows the blocked period in the same user-facing format as the rest of the page', async () => {
+      checkSurveyEligibility.mockResolvedValue({ eligible: false, reason: 'past_period' });
+      const user = userEvent.setup({ delay: null });
+      render(<DashboardPage />);
+
+      await waitFor(() => expect(screen.getByTestId('take-survey-button')).toBeInTheDocument());
+      await user.click(screen.getByTestId('take-survey-button'));
+      await user.click(screen.getByTestId('period-selection-confirm-button'));
+
+      await waitFor(() => expect(screen.getByTestId('duplicate-submission-modal')).toBeInTheDocument());
+      expect(screen.getByTestId('duplicate-submission-message')).toHaveTextContent('H2 2026');
+      expect(screen.getByTestId('duplicate-submission-message').textContent).not.toContain('2026 H2');
+    });
+
+    it('leaves out the "next survey" sentence when there is no later period to point to', async () => {
+      checkSurveyEligibility.mockResolvedValue({
+        eligible: false,
+        reason: 'duplicate',
+        submittedPeriod: 'H1 2026',
+      });
+      const user = userEvent.setup({ delay: null });
+      render(<DashboardPage />);
+
+      await waitFor(() => expect(screen.getByTestId('take-survey-button')).toBeInTheDocument());
+      await user.click(screen.getByTestId('take-survey-button'));
+      await user.click(screen.getByTestId('period-selection-confirm-button'));
+
+      await waitFor(() => expect(screen.getByTestId('duplicate-submission-modal')).toBeInTheDocument());
+      expect(screen.getByTestId('duplicate-submission-message')).toHaveTextContent('already submitted');
+      expect(screen.getByTestId('duplicate-submission-message')).not.toHaveTextContent('scheduled for');
+    });
+
+    it('only offers periods that can still be started, and shows them in the user-facing format', async () => {
+      const user = userEvent.setup({ delay: null });
+      render(<DashboardPage />);
+
+      await waitFor(() => expect(screen.getByTestId('take-survey-button')).toBeInTheDocument());
+      await user.click(screen.getByTestId('take-survey-button'));
+
+      const options = within(screen.getByTestId('take-survey-period-select'))
+        .getAllByRole('option')
+        .map((option) => option.textContent);
+      // Sep 2026: this year's two half-years. Earlier years are always rejected as "past".
+      expect(options).toEqual(['H2 2026 (current)', 'H1 2026']);
     });
   });
 });

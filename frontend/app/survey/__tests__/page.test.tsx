@@ -17,9 +17,10 @@
  *  - Invalid/missing periods cannot be submitted.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, act } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import SurveyPage from '../page';
+import { TeamsAPIError } from '@/lib/api/teams';
 
 const push = vi.fn();
 // Stable references: the real Next.js hooks return stable objects across renders.
@@ -65,6 +66,9 @@ vi.mock('@/lib/data', () => ({
 const getTeamInfoCached = vi.fn();
 vi.mock('@/lib/api/teams', () => ({
   getTeamInfoCached: (...args: unknown[]) => getTeamInfoCached(...args),
+  // The page does `err instanceof TeamsAPIError` when a team lookup fails, so the mocked module
+  // has to provide the class -- otherwise that check throws a TypeError instead of running.
+  TeamsAPIError: class TeamsAPIError extends Error {},
 }));
 
 const submitHealthCheck = vi.fn();
@@ -401,7 +405,7 @@ describe('Survey assessment period (read-only, sourced from Member Home)', () =>
       expect(push).not.toHaveBeenCalled();
     });
 
-    it('disables the confirm button while submitting and calls the API only once even if clicked repeatedly', async () => {
+    it('calls the API only once when the confirm button is clicked twice before React re-renders', async () => {
       let resolveSubmit: (value: { id: string }) => void;
       submitHealthCheck.mockImplementationOnce(
         () => new Promise((resolve) => { resolveSubmit = resolve; })
@@ -413,18 +417,131 @@ describe('Survey assessment period (read-only, sourced from Member Home)', () =>
       await answerAllDimensions(user);
       await user.click(screen.getByRole('button', { name: /submit responses/i }));
 
+      // performSubmit closes the confirm modal as soon as it runs, so a second click made after
+      // a re-render lands on a detached button and never reaches the handler -- that would not
+      // test the guard at all. Two native clicks inside one act() are batched: the modal is
+      // still mounted for the second, which therefore reaches the real handler, and only the
+      // in-flight guard (submitInFlightRef) stops it from submitting twice.
       const confirmButton = screen.getByTestId('submit-confirm-accept');
-      await user.click(confirmButton);
+      act(() => {
+        confirmButton.click();
+        confirmButton.click();
+      });
 
-      // The modal closes immediately on submit, so further "clicks" are simulated by invoking
-      // the handler again directly -- this proves the in-flight guard, not just that the
-      // button disappeared from the DOM.
       await waitFor(() => expect(submitHealthCheck).toHaveBeenCalledTimes(1));
-      await user.click(confirmButton).catch(() => {});
 
       resolveSubmit!({ id: 'session-999' });
       await waitFor(() => expect(screen.getByTestId('thank-you-page')).toBeInTheDocument());
       expect(submitHealthCheck).toHaveBeenCalledTimes(1);
     });
+  });
+});
+
+describe('Survey: team lookup failure', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localStorage.clear();
+    searchParams = new URLSearchParams('');
+    currentUser = { id: 'user-1', name: 'Taylor Lead', hierarchyLevelId: 'level-4', teamIds: ['team-1'] };
+    vi.setSystemTime(new Date(2026, 8, 22));
+  });
+
+  it('shows the team error from the API when the lookup fails with a TeamsAPIError', async () => {
+    getTeamInfoCached.mockRejectedValue(new TeamsAPIError('Team not found'));
+    render(<SurveyPage />);
+
+    await waitFor(() => expect(screen.getByText('Team not found')).toBeInTheDocument());
+  });
+
+  it('shows a generic message when the lookup fails for any other reason', async () => {
+    getTeamInfoCached.mockRejectedValue(new Error('socket hang up'));
+    render(<SurveyPage />);
+
+    await waitFor(() => expect(screen.getByText('Failed to load team information')).toBeInTheDocument());
+    expect(screen.queryByText('socket hang up')).not.toBeInTheDocument();
+  });
+});
+
+describe('Survey: resuming a saved draft', () => {
+  const draftKey = 'surveyDraft:user-1:team-1';
+  const answers = [{ dimensionId: 'mission', score: 3, trend: 'stable' }];
+
+  function saveDraft(fields: { assessmentPeriod: string; selectedAssessmentPeriod?: string }) {
+    localStorage.setItem(
+      draftKey,
+      JSON.stringify({ responses: answers, currentDimension: 1, savedAt: '2026-08-01T00:00:00Z', ...fields }),
+    );
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localStorage.clear();
+    searchParams = new URLSearchParams('');
+    currentUser = { id: 'user-1', name: 'Taylor Lead', hierarchyLevelId: 'level-4', teamIds: ['team-1'] };
+    getTeamInfoCached.mockResolvedValue(TEAM_INFO);
+  });
+
+  it('resumes a draft saved under a manually selected earlier period even after today\'s period has moved on', async () => {
+    // Saved in H2 2026 while working on H1 2026 (a catch-up). Today the auto period is H1 2027,
+    // so the auto-detected period no longer matches the one recorded in the draft.
+    saveDraft({ assessmentPeriod: '2026 H2', selectedAssessmentPeriod: '2026 H1' });
+    vi.setSystemTime(new Date(2027, 0, 10));
+    searchParams = new URLSearchParams('period=2026 H1');
+    render(<SurveyPage />);
+
+    await waitFor(() => expect(screen.getByTestId('selected-period')).toHaveTextContent('H1 2026'));
+    await waitFor(() => expect(screen.getByTestId('draft-restored-banner')).toBeInTheDocument());
+  });
+
+  it('does not resume a draft saved under the auto-detected period once that period has ended', async () => {
+    saveDraft({ assessmentPeriod: '2026 H2', selectedAssessmentPeriod: '2026 H2' });
+    vi.setSystemTime(new Date(2027, 0, 10)); // auto period is now 2027 H1
+    render(<SurveyPage />);
+
+    await waitFor(() => expect(screen.getByTestId('selected-period')).toHaveTextContent('H1 2027'));
+    expect(screen.queryByTestId('draft-restored-banner')).not.toBeInTheDocument();
+  });
+
+  it('does not resume a draft that belongs to a different period than the one being shown', async () => {
+    saveDraft({ assessmentPeriod: '2026 H2', selectedAssessmentPeriod: '2026 H1' });
+    vi.setSystemTime(new Date(2026, 8, 22));
+    render(<SurveyPage />); // no ?period=, so the survey opens for the auto period, 2026 H2
+
+    await waitFor(() => expect(screen.getByTestId('selected-period')).toHaveTextContent('H2 2026'));
+    expect(screen.queryByTestId('draft-restored-banner')).not.toBeInTheDocument();
+  });
+});
+
+describe('Survey: switching teams keeps the chosen period', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localStorage.clear();
+    searchParams = new URLSearchParams('');
+    currentUser = { id: 'user-1', name: 'Taylor Lead', hierarchyLevelId: 'level-4', teamIds: ['team-1', 'team-2'] };
+    vi.setSystemTime(new Date(2026, 8, 22)); // auto period 2026 H2
+    getTeamInfoCached.mockImplementation(async (id: string) => ({ ...TEAM_INFO, id, name: id }));
+  });
+
+  it('keeps a period chosen on Member Home when the user switches to another team', async () => {
+    searchParams = new URLSearchParams('period=2026 H1');
+    const user = userEvent.setup({ delay: null });
+    render(<SurveyPage />);
+
+    await waitFor(() => expect(screen.getByTestId('selected-period')).toHaveTextContent('H1 2026'));
+    await user.selectOptions(await screen.findByTestId('team-selector'), 'team-2');
+
+    await waitFor(() => expect(getTeamInfoCached).toHaveBeenCalledWith('team-2'));
+    await waitFor(() => expect(screen.getByTestId('selected-period')).toHaveTextContent('H1 2026'));
+  });
+
+  it('uses the new team\'s own current period when the user was on the auto-detected one', async () => {
+    const user = userEvent.setup({ delay: null });
+    render(<SurveyPage />);
+
+    await waitFor(() => expect(screen.getByTestId('selected-period')).toHaveTextContent('H2 2026'));
+    await user.selectOptions(await screen.findByTestId('team-selector'), 'team-2');
+
+    await waitFor(() => expect(getTeamInfoCached).toHaveBeenCalledWith('team-2'));
+    await waitFor(() => expect(screen.getByTestId('selected-period')).toHaveTextContent('H2 2026'));
   });
 });

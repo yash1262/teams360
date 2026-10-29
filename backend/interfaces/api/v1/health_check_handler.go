@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"slices"
 	"strconv"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/agopalakrishnan/teams360/backend/domain/healthcheck"
 	"github.com/agopalakrishnan/teams360/backend/domain/organization"
 	"github.com/agopalakrishnan/teams360/backend/interfaces/dto"
+	"github.com/agopalakrishnan/teams360/backend/interfaces/middleware"
 	"github.com/agopalakrishnan/teams360/backend/pkg/logger"
 	"github.com/agopalakrishnan/teams360/backend/pkg/telemetry"
 )
@@ -157,16 +159,16 @@ func (h *HealthCheckHandler) SubmitHealthCheck(c *gin.Context) {
 	if err != nil {
 		telemetry.SetSpanError(span, err)
 
-		var cooldownErr *healthcheck.SubmissionCooldownError
-		if errors.As(err, &cooldownErr) {
-			log.WithField("team_id", req.TeamID).WithField("survey_type", cooldownErr.SurveyType).
+		var duplicateErr *healthcheck.DuplicateSubmissionError
+		if errors.As(err, &duplicateErr) {
+			log.WithField("team_id", req.TeamID).WithField("survey_type", duplicateErr.SurveyType).
 				Warn("rejected duplicate health check submission for an already-submitted period")
 			c.JSON(http.StatusConflict, dto.ErrorResponse{
 				Error:              "Already submitted",
-				Message:            cooldownErr.Error(),
+				Message:            duplicateErr.Error(),
 				Code:               string(healthcheck.PeriodReasonDuplicate),
-				SubmittedPeriod:    cooldownErr.LastSubmittedPeriod,
-				NextEligiblePeriod: cooldownErr.NextEligiblePeriod,
+				SubmittedPeriod:    duplicateErr.LastSubmittedPeriod,
+				NextEligiblePeriod: duplicateErr.NextEligiblePeriod,
 			})
 			return
 		}
@@ -497,6 +499,16 @@ func (h *HealthCheckHandler) CheckSurveyEligibility(c *gin.Context) {
 		return
 	}
 
+	// The answer reveals whether a user or team has submitted a period, so the caller may only
+	// ask about their own submissions or a team they belong to or lead (admins: any).
+	if !canQueryEligibilityScope(c, surveyType, teamID, userID) {
+		c.JSON(http.StatusForbidden, dto.ErrorResponse{
+			Error:   "Access denied",
+			Message: "You can only check eligibility for your own submissions or for a team you belong to or lead",
+		})
+		return
+	}
+
 	submittedPeriods, err := h.repository.FindSubmittedPeriods(ctx, healthcheck.LatestSubmissionQuery{
 		SurveyType: surveyType,
 		TeamID:     teamID,
@@ -518,14 +530,33 @@ func (h *HealthCheckHandler) CheckSurveyEligibility(c *gin.Context) {
 			Eligible:           false,
 			Reason:             string(reason),
 			SubmittedPeriod:    healthcheck.FormatPeriodForDisplay(assessmentPeriod),
-			NextEligiblePeriod: healthcheck.NextEligiblePeriod(submittedPeriods),
+			NextEligiblePeriod: healthcheck.NextEligiblePeriodAfter(assessmentPeriod, submittedPeriods),
 		})
-	default: // future_period, past_period, or an unrecognized format
+	default: // future_period, past_period, or an unsupported period (invalid_period)
 		c.JSON(http.StatusOK, dto.SurveyEligibilityResponse{
 			Eligible: false,
 			Reason:   string(reason),
 		})
 	}
+}
+
+// canQueryEligibilityScope reports whether the authenticated caller may ask about the given
+// scope. The scope comes from the query string, so it is checked against the validated JWT
+// claims rather than trusted: an Individual Survey lookup must be for the caller themselves,
+// and a Post-Workshop Survey lookup must be for a team they belong to or lead (the claims'
+// team list covers both). Admins may ask about any scope.
+func canQueryEligibilityScope(c *gin.Context, surveyType, teamID, userID string) bool {
+	if isAdminRequest(c) {
+		return true
+	}
+	claims, ok := middleware.GetClaimsFromContext(c)
+	if !ok {
+		return false
+	}
+	if surveyType == healthcheck.SurveyTypePostWorkshop {
+		return slices.Contains(claims.TeamIDs, teamID)
+	}
+	return userID == claims.UserID
 }
 
 // GetAssessmentPeriods handles GET /api/v1/assessment-periods
@@ -617,11 +648,11 @@ func validateAssessmentPeriod(period string) error {
 		return nil
 	}
 
-	// Try half-yearly format: "YYYY H1". The Individual and Post-Workshop surveys only ever
-	// submit this format, and only for a currently open period -- see
-	// healthcheck.CheckPeriodEligibility for the authoritative, persisted-record-aware check
-	// this mirrors at the format-validation layer (a cheap, DB-free rejection of an obviously
-	// out-of-range period before the command handler even runs).
+	// Try half-yearly format: "YYYY H1". Only a future half-year is rejected here, as a cheap,
+	// DB-free sanity check. A period from an earlier year is deliberately let through:
+	// whether it is a duplicate (409, with the next eligible period) or simply closed (400) is
+	// for healthcheck.CheckPeriodEligibility to say, since it knows what was already
+	// submitted. Rejecting it here would hide the duplicate case behind a generic 400.
 	if m := halfYearlyPeriodRegex.FindStringSubmatch(period); m != nil {
 		year, _ := strconv.Atoi(m[1])
 		half, _ := strconv.Atoi(m[2])
@@ -631,9 +662,6 @@ func validateAssessmentPeriod(period string) error {
 		}
 		if year > currentYear || (year == currentYear && half > currentHalf) {
 			return fmt.Errorf("invalid assessment period: future assessment periods are not allowed")
-		}
-		if year < currentYear {
-			return fmt.Errorf("invalid assessment period: previous-year assessment periods are not allowed")
 		}
 		return nil
 	}

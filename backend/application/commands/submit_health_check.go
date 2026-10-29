@@ -8,18 +8,6 @@ import (
 	"github.com/agopalakrishnan/teams360/backend/domain/healthcheck"
 )
 
-// parseSubmissionDate parses a session date in either RFC3339 (as sent by the frontend on
-// submission) or plain "YYYY-MM-DD" (as returned by Postgres DATE columns) form.
-func parseSubmissionDate(date string) (time.Time, bool) {
-	if t, err := time.Parse(time.RFC3339, date); err == nil {
-		return t, true
-	}
-	if t, err := time.Parse("2006-01-02", date); err == nil {
-		return t, true
-	}
-	return time.Time{}, false
-}
-
 // SubmitHealthCheckCommand represents the command to submit a health check
 type SubmitHealthCheckCommand struct {
 	ID               string
@@ -43,12 +31,24 @@ type HealthCheckResponseCommand struct {
 // SubmitHealthCheckHandler handles the submit health check command
 type SubmitHealthCheckHandler struct {
 	repository healthcheck.Repository
+	// now is the clock period eligibility is decided against. It is always the server's
+	// clock: the command's Date is stored as the session date but never decides which
+	// periods are open.
+	now func() time.Time
 }
 
-// NewSubmitHealthCheckHandler creates a new command handler
+// NewSubmitHealthCheckHandler creates a new command handler that decides eligibility
+// against the server's clock.
 func NewSubmitHealthCheckHandler(repository healthcheck.Repository) *SubmitHealthCheckHandler {
+	return NewSubmitHealthCheckHandlerWithClock(repository, time.Now)
+}
+
+// NewSubmitHealthCheckHandlerWithClock creates a command handler that reads "now" from the
+// given clock, so tests can pin the current date.
+func NewSubmitHealthCheckHandlerWithClock(repository healthcheck.Repository, now func() time.Time) *SubmitHealthCheckHandler {
 	return &SubmitHealthCheckHandler{
 		repository: repository,
+		now:        now,
 	}
 }
 
@@ -70,13 +70,21 @@ func (h *SubmitHealthCheckHandler) Handle(cmd SubmitHealthCheckCommand) (*health
 		surveyType = healthcheck.SurveyTypeIndividual
 	}
 
-	// Enforce one submission per (scope, survey type, year, half-year): the caller's scope
-	// (the user, for Individual Survey; the team, for Post-Workshop Survey) may not resubmit
-	// an assessment period it has already completed, and may only target a period that is
+	// Store every supported period in its one canonical form ("2026 Q1" and "2026 - 2nd
+	// Half"-style labels fold into "YYYY H1"/"YYYY H2"), so two labels for the same period
+	// are the same string and the database's unique index sees them as duplicates.
+	if canonical, ok := healthcheck.CanonicalPeriod(cmd.AssessmentPeriod); ok {
+		cmd.AssessmentPeriod = canonical
+	}
+
+	// Enforce one submission per (scope, survey type, period): the caller's scope (the user,
+	// for Individual Survey; the team, for Post-Workshop Survey) may not resubmit an
+	// assessment period it has already completed, and may only target a period that is
 	// currently open (see healthcheck.CheckPeriodEligibility). Persisted records are the
-	// source of truth -- not submission dates or elapsed time. This is a friendly pre-check;
-	// the database's unique index (see the "period submission uniqueness" migration) is the
-	// authoritative, race-safe guard against two concurrent requests both passing this check.
+	// source of truth -- not submission dates or elapsed time -- and "now" is the server's
+	// clock, never the client-supplied Date. This is a friendly pre-check; the database's
+	// unique index (see the "half-year period uniqueness" migration) is the authoritative,
+	// race-safe guard against two concurrent requests both passing this check.
 	if cmd.Completed {
 		submittedPeriods, err := h.repository.FindSubmittedPeriods(context.Background(), healthcheck.LatestSubmissionQuery{
 			SurveyType: surveyType,
@@ -86,17 +94,11 @@ func (h *SubmitHealthCheckHandler) Handle(cmd SubmitHealthCheckCommand) (*health
 		if err != nil {
 			return nil, fmt.Errorf("failed to check submission eligibility: %w", err)
 		}
-		now := time.Now()
-		if parsed, ok := parseSubmissionDate(cmd.Date); ok {
-			now = parsed
-		}
-		switch reason := healthcheck.CheckPeriodEligibility(cmd.AssessmentPeriod, now, submittedPeriods); reason {
-		case healthcheck.PeriodEligible, healthcheck.PeriodReasonInvalidFormat:
-			// An unrecognized period format is not this check's concern -- it is rejected
-			// by the HTTP layer's format validation before reaching this command.
+		switch reason := healthcheck.CheckPeriodEligibility(cmd.AssessmentPeriod, h.now(), submittedPeriods); reason {
+		case healthcheck.PeriodEligible:
 		case healthcheck.PeriodReasonDuplicate:
-			return nil, healthcheck.NewSubmissionCooldownError(surveyType, cmd.AssessmentPeriod, submittedPeriods)
-		default: // PeriodReasonFuture or PeriodReasonPast
+			return nil, healthcheck.NewDuplicateSubmissionError(surveyType, cmd.AssessmentPeriod, submittedPeriods)
+		default: // future, past, or an unrecognized period (already rejected by validate)
 			return nil, healthcheck.NewPeriodNotOpenError(surveyType, cmd.AssessmentPeriod, reason)
 		}
 	}
@@ -142,6 +144,12 @@ func (h *SubmitHealthCheckHandler) validate(cmd SubmitHealthCheckCommand) error 
 
 	if cmd.Date == "" {
 		return fmt.Errorf("date is required")
+	}
+
+	if cmd.Completed {
+		if _, ok := healthcheck.CanonicalPeriod(cmd.AssessmentPeriod); !ok {
+			return fmt.Errorf("assessmentPeriod is required for a completed survey and must be a half-yearly (\"2026 H1\"), monthly (\"2026 Mar\") or yearly (\"2026\") period")
+		}
 	}
 
 	if cmd.SurveyType != "" && cmd.SurveyType != healthcheck.SurveyTypeIndividual && cmd.SurveyType != healthcheck.SurveyTypePostWorkshop {

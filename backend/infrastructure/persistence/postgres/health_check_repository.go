@@ -12,9 +12,9 @@ import (
 )
 
 // uniqueViolationConstraints maps the Postgres unique-index names enforcing "one submission
-// per (scope, survey type, year, half-year)" to the survey type they guard, so a 23505
+// per (scope, survey type, period)" to the survey type they guard, so a 23505
 // (unique violation) error from Save() can be translated into a friendly
-// healthcheck.SubmissionCooldownError.
+// healthcheck.DuplicateSubmissionError.
 var uniqueViolationConstraints = map[string]string{
 	"uniq_individual_period_submission":    healthcheck.SurveyTypeIndividual,
 	"uniq_post_workshop_period_submission": healthcheck.SurveyTypePostWorkshop,
@@ -62,15 +62,20 @@ func (r *HealthCheckRepository) Save(ctx context.Context, session *healthcheck.H
 
 	if err != nil {
 		var pqErr *pq.Error
-		if errors.As(err, &pqErr) && (pqErr.Code == "23P01" || pqErr.Code == "23505") {
+		if errors.As(err, &pqErr) && pqErr.Code == "23505" {
 			if constraintSurveyType, known := uniqueViolationConstraints[pqErr.Constraint]; known {
+				// The failed insert aborted this transaction, and the lookup below runs on
+				// another pooled connection. Give this one back first: holding it while
+				// waiting for a second would let concurrent duplicate submissions exhaust a
+				// small pool and time out instead of getting a clean 409.
+				_ = tx.Rollback()
 				submitted, serr := r.FindSubmittedPeriods(ctx, healthcheck.LatestSubmissionQuery{
 					SurveyType: constraintSurveyType,
 					TeamID:     session.TeamID,
 					UserID:     session.UserID,
 				})
 				if serr == nil {
-					return healthcheck.NewSubmissionCooldownError(constraintSurveyType, session.AssessmentPeriod, submitted)
+					return healthcheck.NewDuplicateSubmissionError(constraintSurveyType, session.AssessmentPeriod, submitted)
 				}
 				return fmt.Errorf("submission rejected: %s for %s already submitted", constraintSurveyType, session.AssessmentPeriod)
 			}
@@ -512,9 +517,12 @@ func (r *HealthCheckRepository) GetTeamSubmissionStatus(ctx context.Context, tea
 //   - individual:    matches by UserID only (a different user's submission never conflicts).
 //   - post_workshop: matches by TeamID only (one workshop consensus per team).
 //
+// Historical sessions that never recorded a period are left out: they cannot be matched to a
+// period, so they neither block a new submission nor break the scan below.
+//
 // This is the persisted source of truth healthcheck.CheckPeriodEligibility and
-// healthcheck.NextEligiblePeriod are evaluated against -- eligibility is never inferred from
-// submission dates.
+// healthcheck.NextEligiblePeriodAfter are evaluated against -- eligibility is never inferred
+// from submission dates.
 func (r *HealthCheckRepository) FindSubmittedPeriods(ctx context.Context, query healthcheck.LatestSubmissionQuery) ([]string, error) {
 	var scopeColumn, scopeValue string
 	if query.SurveyType == healthcheck.SurveyTypePostWorkshop {
@@ -527,6 +535,7 @@ func (r *HealthCheckRepository) FindSubmittedPeriods(ctx context.Context, query 
 		SELECT assessment_period
 		FROM health_check_sessions
 		WHERE %s = $1 AND survey_type = $2 AND completed = true
+		  AND assessment_period IS NOT NULL AND assessment_period <> ''
 	`, scopeColumn), scopeValue, query.SurveyType)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query submitted periods: %w", err)

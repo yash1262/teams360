@@ -6,7 +6,7 @@ import { getCurrentUser, logout, authenticatedFetch } from '@/lib/auth';
 import { HEALTH_DIMENSIONS } from '@/lib/data';
 import { API_BASE_URL } from '@/lib/api/client';
 import { getOrgConfig, getHierarchyLevel } from '@/lib/org-config';
-import { getAssessmentPeriod, getSelectablePeriods, parseAssessmentPeriod, toCadence, formatPeriodLabel, formatMonthYear } from '@/lib/assessment-period';
+import { getAssessmentPeriod, getCurrentYearPeriods, toCadence, formatPeriodLabel, formatMonthYear } from '@/lib/assessment-period';
 import { LogOut, Building2, ChevronDown, ClipboardList, TrendingUp, Calendar, Clock, CalendarClock, BookOpen, X, AlertCircle } from 'lucide-react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar } from 'recharts';
 import { getTeamInfoCached, TeamInfo } from '@/lib/api/teams';
@@ -195,17 +195,9 @@ export default function MemberHomePage() {
 
   const periodOptions = useMemo(() => {
     if (!team) return [];
-    // getSelectablePeriods walks back several years of history for the dropdown, but the
-    // backend only ever considers the current year's periods open for a new submission
-    // (see healthcheck.CurrentlyOpenPeriods) -- anything from an earlier year is rejected as
-    // "past_period" regardless of whether it was ever submitted. Offering those older periods
-    // here just sets the Team Member up to pick something that can never succeed, so they are
-    // filtered out before being shown.
-    const currentYear = new Date().getFullYear();
-    const options = getSelectablePeriods(toCadence(team.cadence)).filter((p) => {
-      const parsed = parseAssessmentPeriod(p);
-      return parsed ? parsed.year >= currentYear : true;
-    });
+    // Only periods from the current year can still be started; the backend rejects anything
+    // older as "past_period" (see getCurrentYearPeriods), so don't offer them.
+    const options = getCurrentYearPeriods(toCadence(team.cadence));
     return options.includes(assessmentPeriod) ? options : [assessmentPeriod, ...options];
   }, [team, assessmentPeriod]);
 
@@ -236,13 +228,15 @@ export default function MemberHomePage() {
         if (result.reason === 'duplicate') {
           setBlockedInfo({
             reason: 'duplicate',
-            submittedPeriod: result.submittedPeriod || assessmentPeriod,
+            submittedPeriod: result.submittedPeriod || formatPeriodLabel(assessmentPeriod),
             nextEligiblePeriod: result.nextEligiblePeriod || '',
           });
         } else {
+          // Shown in the same user-facing format as the rest of the page ("H1 2026", not the
+          // stored "2026 H1").
           setBlockedInfo({
             reason: 'not_open',
-            submittedPeriod: assessmentPeriod,
+            submittedPeriod: formatPeriodLabel(assessmentPeriod),
             nextEligiblePeriod: result.nextEligiblePeriod || '',
           });
         }
@@ -639,10 +633,12 @@ export default function MemberHomePage() {
                     <span className="font-semibold">Individual Survey</span>{' '}
                     for <span className="font-semibold">{blockedInfo.submittedPeriod}</span>.
                   </p>
-                  <p className="text-base text-gray-700 leading-relaxed mb-8">
-                    Your next survey is scheduled for{' '}
-                    <span className="font-semibold">{blockedInfo.nextEligiblePeriod}</span>.
-                  </p>
+                  {blockedInfo.nextEligiblePeriod && (
+                    <p className="text-base text-gray-700 leading-relaxed mb-8">
+                      Your next survey is scheduled for{' '}
+                      <span className="font-semibold">{blockedInfo.nextEligiblePeriod}</span>.
+                    </p>
+                  )}
                 </>
               ) : (
                 <p className="text-base text-gray-700 leading-relaxed mb-8">

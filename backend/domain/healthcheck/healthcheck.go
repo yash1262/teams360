@@ -62,25 +62,34 @@ type LatestSubmissionQuery struct {
 	UserID     string // required when SurveyType == SurveyTypeIndividual
 }
 
-// SubmissionCooldownError indicates a survey submission was rejected because the caller's
+// DuplicateSubmissionError indicates a survey submission was rejected because the caller's
 // scope (the user, for Individual Survey; the team, for Post-Workshop Survey) already has a
 // completed submission for this exact survey type and assessment period -- one submission
-// per (scope, survey type, year, half-year) is allowed. See CheckPeriodEligibility.
-type SubmissionCooldownError struct {
+// per (scope, survey type, period) is allowed. See CheckPeriodEligibility.
+type DuplicateSubmissionError struct {
 	SurveyType          string
-	LastSubmittedPeriod string // user-facing H1/H2 label of the duplicated period
-	// NextEligiblePeriod is the user-facing H1/H2 label (e.g. "H2 2026") the caller next
-	// becomes eligible for, computed dynamically from every period already on record for
-	// this scope (see NextEligiblePeriod). The survey experience never exposes day-level
-	// dates, so this label is what error messages and API responses surface.
+	LastSubmittedPeriod string // user-facing label of the duplicated period, e.g. "H1 2026"
+	// NextEligiblePeriod is the user-facing label (e.g. "H2 2026") the caller next becomes
+	// eligible for, computed from every period already on record for this scope (see
+	// NextEligiblePeriodAfter). It is empty when there is no later period to point to. The
+	// survey experience never exposes day-level dates, so this label is what error messages
+	// and API responses surface.
 	NextEligiblePeriod string
 }
 
-func (e *SubmissionCooldownError) Error() string {
-	return fmt.Sprintf(
-		"You have already submitted the %s for %s. Your next eligible survey period is %s.",
-		SurveyTypeLabel(e.SurveyType), e.LastSubmittedPeriod, e.NextEligiblePeriod,
-	)
+func (e *DuplicateSubmissionError) Error() string {
+	// A post-workshop survey belongs to the team, so another Team Lead can hit this error
+	// without having submitted anything themselves: say "Your team", not "You".
+	subject, possessive := "You have", "Your"
+	if e.SurveyType == SurveyTypePostWorkshop {
+		subject, possessive = "Your team has", "Your team's"
+	}
+
+	msg := fmt.Sprintf("%s already submitted the %s for %s.", subject, SurveyTypeLabel(e.SurveyType), e.LastSubmittedPeriod)
+	if e.NextEligiblePeriod != "" {
+		msg += fmt.Sprintf(" %s next eligible survey period is %s.", possessive, e.NextEligiblePeriod)
+	}
+	return msg
 }
 
 // SurveyTypeLabel renders a survey type constant as a user-facing label.
@@ -91,21 +100,21 @@ func SurveyTypeLabel(surveyType string) string {
 	return "Individual Survey"
 }
 
-// NewSubmissionCooldownError builds a SubmissionCooldownError for a duplicate submission of
+// NewDuplicateSubmissionError builds a DuplicateSubmissionError for a duplicate submission of
 // duplicatedPeriod, given every period already submitted for this scope and survey type
 // (submittedPeriods -- the persisted source of truth, not submitted dates).
-func NewSubmissionCooldownError(surveyType string, duplicatedPeriod string, submittedPeriods []string) *SubmissionCooldownError {
-	return &SubmissionCooldownError{
+func NewDuplicateSubmissionError(surveyType string, duplicatedPeriod string, submittedPeriods []string) *DuplicateSubmissionError {
+	return &DuplicateSubmissionError{
 		SurveyType:          surveyType,
 		LastSubmittedPeriod: FormatPeriodForDisplay(duplicatedPeriod),
-		NextEligiblePeriod:  NextEligiblePeriod(submittedPeriods),
+		NextEligiblePeriod:  NextEligiblePeriodAfter(duplicatedPeriod, submittedPeriods),
 	}
 }
 
 // PeriodNotOpenError indicates a survey submission was rejected because the requested
 // assessment period is not currently open for a brand-new submission -- it is either a
-// future half-year that has not started yet, or a stale period from an earlier year. Unlike
-// SubmissionCooldownError, this is never about a duplicate: see CheckPeriodEligibility.
+// future period that has not started yet, or one that has already ended. Unlike
+// DuplicateSubmissionError, this is never about a duplicate: see CheckPeriodEligibility.
 type PeriodNotOpenError struct {
 	SurveyType string
 	Period     string // user-facing H1/H2 label of the rejected period

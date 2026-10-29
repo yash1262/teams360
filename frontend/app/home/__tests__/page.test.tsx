@@ -83,7 +83,7 @@ describe('Member Home: Take Survey flow', () => {
   it('displays the auto-detected period in the Current Period label', async () => {
     render(<MemberHomePage />);
 
-    await waitFor(() => expect(screen.getByTestId('current-period')).toHaveTextContent('Current Period: 2026 H2'));
+    await waitFor(() => expect(screen.getByTestId('current-period')).toHaveTextContent('Current Period: H2 2026'));
   });
 
   it('keeps showing the auto-detected period in the Current Period label after the user overrides the dropdown', async () => {
@@ -96,7 +96,7 @@ describe('Member Home: Take Survey flow', () => {
     // The dropdown reflects the override...
     expect(screen.getByTestId('assessment-period-select')).toHaveValue('2026 H1');
     // ...but the Current Period label must remain the auto-detected value, never the selection
-    expect(screen.getByTestId('current-period')).toHaveTextContent('Current Period: 2026 H2');
+    expect(screen.getByTestId('current-period')).toHaveTextContent('Current Period: H2 2026');
   });
 
   it('renders the bordered "Select assessment period" panel with a labeled dropdown and helper text', async () => {
@@ -320,6 +320,57 @@ describe('Member Home: Take Survey flow', () => {
       for (const call of checkSurveyEligibility.mock.calls) {
         expect(call[0].surveyType).not.toBe('post_workshop');
       }
+    });
+  });
+
+  it('shows a blocked period in the same user-facing format as the rest of the page', async () => {
+    checkSurveyEligibility.mockResolvedValue({ eligible: false, reason: 'past_period' });
+    const user = userEvent.setup({ delay: null });
+    render(<MemberHomePage />);
+
+    await waitFor(() => expect(screen.getByTestId('take-survey-btn')).toBeInTheDocument());
+    await user.click(screen.getByTestId('take-survey-btn'));
+
+    await waitFor(() => expect(screen.getByTestId('duplicate-submission-modal')).toBeInTheDocument());
+    const message = screen.getByTestId('duplicate-submission-message');
+    expect(message).toHaveTextContent('H2 2026 is not open for submission');
+    expect(message.textContent).not.toContain('2026 H2');
+  });
+
+  it('leaves out the "next survey" sentence when there is no later period to point to', async () => {
+    checkSurveyEligibility.mockResolvedValue({ eligible: false, reason: 'duplicate', submittedPeriod: 'H2 2026' });
+    const user = userEvent.setup({ delay: null });
+    render(<MemberHomePage />);
+
+    await waitFor(() => expect(screen.getByTestId('take-survey-btn')).toBeInTheDocument());
+    await user.click(screen.getByTestId('take-survey-btn'));
+
+    await waitFor(() => expect(screen.getByTestId('duplicate-submission-modal')).toBeInTheDocument());
+    expect(screen.getByTestId('duplicate-submission-message')).toHaveTextContent('already submitted');
+    expect(screen.getByTestId('duplicate-submission-message')).not.toHaveTextContent('scheduled for');
+  });
+
+  describe('teams on a monthly or yearly cadence', () => {
+    // The eligibility endpoint understands every supported cadence, so these teams are checked
+    // against their own period rather than being blocked as an "invalid" period.
+    it.each([
+      ['monthly', '2026 Sep'],
+      ['yearly', '2026'],
+    ])('asks about, and opens, the %s team\'s own period (%s)', async (cadence, period) => {
+      getTeamInfoCached.mockResolvedValue({ ...TEAM_INFO, cadence });
+      const user = userEvent.setup({ delay: null });
+      render(<MemberHomePage />);
+
+      await waitFor(() => expect(screen.getByTestId('assessment-period-select')).toHaveValue(period));
+      await user.click(screen.getByTestId('take-survey-btn'));
+
+      await waitFor(() => expect(push).toHaveBeenCalledWith(`/survey?period=${encodeURIComponent(period)}`));
+      expect(checkSurveyEligibility).toHaveBeenCalledWith({
+        surveyType: 'individual',
+        assessmentPeriod: period,
+        userId: 'user-1',
+      });
+      expect(screen.queryByTestId('duplicate-submission-modal')).not.toBeInTheDocument();
     });
   });
 });

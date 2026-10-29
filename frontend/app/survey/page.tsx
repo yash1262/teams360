@@ -24,6 +24,38 @@ function getDraftKey(userId: string, teamId: string): string {
   return `surveyDraft:${userId}:${teamId}`;
 }
 
+/**
+ * The saved draft for this user and team, if it belongs to the period about to be shown;
+ * otherwise null (including when the saved draft is corrupt).
+ *
+ * - A draft saved under a manually selected period belongs to that period: it is resumed
+ *   whenever the same period is shown again, even after today's auto-detected period has moved
+ *   on (a Team Member working on last half-year's survey must not lose it at midnight on July 1).
+ * - A draft saved under the auto-detected period belongs to that period only, so it goes stale
+ *   once the auto-detected period changes.
+ *
+ * @param autoPeriod - Today's auto-detected period for the team
+ * @param shownPeriod - The period the survey is about to open for
+ */
+function loadApplicableDraft(userId: string, teamId: string, autoPeriod: string, shownPeriod: string): SurveyDraft | null {
+  try {
+    const draftJson = localStorage.getItem(getDraftKey(userId, teamId));
+    if (!draftJson) return null;
+    const draft: SurveyDraft = JSON.parse(draftJson);
+    if (!draft.responses || draft.responses.length === 0) return null;
+
+    const draftPeriod = draft.selectedAssessmentPeriod || draft.assessmentPeriod;
+    if (draftPeriod !== shownPeriod) return null;
+
+    const savedUnderManualSelection = draftPeriod !== draft.assessmentPeriod;
+    if (!savedUnderManualSelection && draft.assessmentPeriod !== autoPeriod) return null;
+
+    return draft;
+  } catch {
+    return null; // Ignore corrupt draft
+  }
+}
+
 export default function SurveyPage() {
   return (
     <Suspense fallback={
@@ -91,25 +123,13 @@ function SurveyPageContent() {
             // arrives via the "period" query param and takes precedence over today's auto-detection.
             const initialPeriod = preferredPeriod && parseAssessmentPeriod(preferredPeriod) ? preferredPeriod : currentPeriod;
             setAssessmentPeriod(initialPeriod);
-            // Restore draft after team info loaded. The draft's `assessmentPeriod` field is only
-            // a staleness key (today's auto-detected period at save time) -- it does NOT tell us
-            // which period the draft's answers were actually for, so it must never be used to
-            // overwrite the period the user just chose on Member Home. Only resume the draft's
-            // responses when its own recorded selection already matches `initialPeriod`; otherwise
-            // the draft belongs to a different period selection and is left untouched (no restore).
-            try {
-              const draftJson = localStorage.getItem(getDraftKey(currentUser.id, teamId));
-              if (draftJson) {
-                const draft: SurveyDraft = JSON.parse(draftJson);
-                const draftPeriod = draft.selectedAssessmentPeriod || draft.assessmentPeriod;
-                if (draft.assessmentPeriod === currentPeriod && draft.responses.length > 0 && draftPeriod === initialPeriod) {
-                  setResponses(draft.responses);
-                  setCurrentDimension(draft.currentDimension);
-                  setDraftRestored(true);
-                }
-              }
-            } catch {
-              // Ignore corrupt draft
+            // Restore the draft only if it belongs to the period being shown: it must never
+            // overwrite the period the user just chose on Member Home (see loadApplicableDraft).
+            const draft = loadApplicableDraft(currentUser.id, teamId, currentPeriod, initialPeriod);
+            if (draft) {
+              setResponses(draft.responses);
+              setCurrentDimension(draft.currentDimension);
+              setDraftRestored(true);
             }
             draftInitialized.current = true;
             setTeamLoading(false);
@@ -167,21 +187,18 @@ function SurveyPageContent() {
         setTeam(teamInfo);
         const currentPeriod = getAssessmentPeriod(new Date(), toCadence(teamInfo.cadence));
         setAutoAssessmentPeriod(currentPeriod);
-        setAssessmentPeriod(currentPeriod);
-        // Restore draft for the new team
-        try {
-          const draftJson = localStorage.getItem(getDraftKey(user.id, newTeamId));
-          if (draftJson) {
-            const draft: SurveyDraft = JSON.parse(draftJson);
-            if (draft.assessmentPeriod === currentPeriod && draft.responses.length > 0) {
-              setResponses(draft.responses);
-              setCurrentDimension(draft.currentDimension);
-              setDraftRestored(true);
-              setAssessmentPeriod(draft.selectedAssessmentPeriod || currentPeriod);
-            }
-          }
-        } catch {
-          // Ignore corrupt draft
+        // Keep the period the user deliberately chose (for example on Member Home): switching
+        // teams must not silently move the submission to a different period. Only when they
+        // were on the auto-detected period does the new team's own current period apply.
+        const choseOtherPeriod =
+          assessmentPeriod !== '' && assessmentPeriod !== autoAssessmentPeriod && !!parseAssessmentPeriod(assessmentPeriod);
+        const shownPeriod = choseOtherPeriod ? assessmentPeriod : currentPeriod;
+        setAssessmentPeriod(shownPeriod);
+        const draft = loadApplicableDraft(user.id, newTeamId, currentPeriod, shownPeriod);
+        if (draft) {
+          setResponses(draft.responses);
+          setCurrentDimension(draft.currentDimension);
+          setDraftRestored(true);
         }
         draftInitialized.current = true;
         setTeamLoading(false);

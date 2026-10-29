@@ -10,7 +10,7 @@ import * as XLSX from 'xlsx';
 import { AlertCircle } from 'lucide-react';
 import { getTeamSubmissionStatus, getAssessmentPeriods, checkSurveyEligibility, TeamSubmissionStatus } from '@/lib/api/health-checks';
 import { API_BASE_URL } from '@/lib/api/client';
-import { getAssessmentPeriod, getSelectablePeriods, parseAssessmentPeriod, toCadence, formatPeriodLabel, formatMonthYear } from '@/lib/assessment-period';
+import { getAssessmentPeriod, getCurrentYearPeriods, describePeriodOptions, parseAssessmentPeriod, toCadence, formatPeriodLabel, formatMonthYear } from '@/lib/assessment-period';
 import { getTeamInfoCached } from '@/lib/api/teams';
 import { RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, LineChart, Line, ResponsiveContainer } from 'recharts';
 import OnboardingModal from '@/components/OnboardingModal';
@@ -75,11 +75,14 @@ export default function DashboardPage() {
   const [teamCadence, setTeamCadence] = useState<string>('half-yearly');
   // Which survey flow the period-selection modal is being shown for, or null when closed.
   const [pendingSurveyType, setPendingSurveyType] = useState<'individual' | 'post_workshop' | null>(null);
-  // True while the pre-open six-month cooldown eligibility check is in flight.
+  // True while the pre-open eligibility check is in flight.
   const [checkingEligibility, setCheckingEligibility] = useState(false);
-  // Set when the eligibility check finds the scope still within the six-month cooldown;
-  // renders the "already submitted" info modal instead of opening the survey.
-  const [duplicateInfo, setDuplicateInfo] = useState<{
+  // Set when the eligibility check says the chosen period can't be started; renders an info
+  // modal instead of opening the survey. "duplicate" means this scope already submitted that
+  // period; "not_open" means the period isn't open for submission (not yet started, already
+  // over, or not a valid period).
+  const [blockedInfo, setBlockedInfo] = useState<{
+    reason: 'duplicate' | 'not_open';
     surveyType: 'individual' | 'post_workshop';
     submittedPeriod: string;
     nextEligiblePeriod: string;
@@ -340,48 +343,75 @@ export default function DashboardPage() {
     return query ? `/survey?${query}` : '/survey';
   };
 
-  // Called from the period-selection modal's confirm button. Checks the shared six-month
-  // submission cooldown before opening the survey; individual surveys are scoped to the Team Lead's own user ID,
-  // post-workshop surveys are scoped to the selected team. If the eligibility check itself
+  // Called from the period-selection modal's confirm button. Checks whether the chosen period
+  // can be started before opening the survey: Individual surveys are scoped to the Team Lead's
+  // own user ID, post-workshop surveys to the selected team. If the eligibility check itself
   // fails (e.g. network error), we fail open and let the authoritative server-side check at
   // submit time (409 Conflict) be the backstop, rather than blocking a legitimate submission.
   const handleConfirmSurvey = async () => {
     if (!pendingSurveyType || !user) return;
     const surveyType = pendingSurveyType;
+    const openSurvey = () => {
+      setPendingSurveyType(null);
+      router.push(buildSurveyUrl(surveyType === 'post_workshop' ? 'post_workshop' : undefined));
+    };
+
+    // A post-workshop check is about a team, so without one there is nothing to ask the server.
+    if (surveyType === 'post_workshop' && !teamId) {
+      openSurvey();
+      return;
+    }
 
     setCheckingEligibility(true);
     try {
-      const result = await checkSurveyEligibility({
-        surveyType,
-        assessmentPeriod: takeSurveyPeriod,
-        teamId: surveyType === 'post_workshop' ? teamId : undefined,
-        userId: surveyType === 'individual' ? user.id : undefined,
-      });
+      const result = await checkSurveyEligibility(
+        surveyType === 'post_workshop'
+          ? { surveyType, assessmentPeriod: takeSurveyPeriod, teamId: teamId as string }
+          : { surveyType, assessmentPeriod: takeSurveyPeriod, userId: user.id },
+      );
 
       if (!result.eligible) {
+        // Only a "duplicate" reason means this scope already submitted the period. Any other
+        // reason (not yet open, already over, invalid) must not reuse that wording:
+        // submittedPeriod and nextEligiblePeriod are empty then, so it would claim a
+        // submission that never happened and point to a blank "next survey".
         setPendingSurveyType(null);
-        setDuplicateInfo({
-          surveyType,
-          submittedPeriod: result.submittedPeriod || takeSurveyPeriod,
-          nextEligiblePeriod: result.nextEligiblePeriod || '',
-        });
+        setBlockedInfo(
+          result.reason === 'duplicate'
+            ? {
+                reason: 'duplicate',
+                surveyType,
+                submittedPeriod: result.submittedPeriod || formatPeriodLabel(takeSurveyPeriod),
+                nextEligiblePeriod: result.nextEligiblePeriod || '',
+              }
+            : {
+                reason: 'not_open',
+                surveyType,
+                submittedPeriod: formatPeriodLabel(takeSurveyPeriod),
+                nextEligiblePeriod: '',
+              },
+        );
         return;
       }
 
-      setPendingSurveyType(null);
-      router.push(buildSurveyUrl(surveyType === 'post_workshop' ? 'post_workshop' : undefined));
+      openSurvey();
     } catch {
       // Fail open: proceed to the survey. The submit-time 409 check remains authoritative.
-      setPendingSurveyType(null);
-      router.push(buildSurveyUrl(surveyType === 'post_workshop' ? 'post_workshop' : undefined));
+      openSurvey();
     } finally {
       setCheckingEligibility(false);
     }
   };
 
   // All useMemo hooks must be called unconditionally — before any early return
+  // Labels for the data-filter dropdown; equivalent periods (e.g. historical "2026 Q1" and
+  // "2026 Q2", which both read "H1 2026") are kept apart.
+  const periodLabels = useMemo(() => describePeriodOptions(assessmentPeriodOptions), [assessmentPeriodOptions]);
+
   const takeSurveyPeriodOptions = useMemo(() => {
-    const options = getSelectablePeriods(toCadence(teamCadence));
+    // Only periods from the current year can still be started; the backend rejects anything
+    // older as "past_period", so offering it would only set the Team Lead up to fail.
+    const options = getCurrentYearPeriods(toCadence(teamCadence));
     return options.includes(takeSurveyPeriod) ? options : [takeSurveyPeriod, ...options];
   }, [teamCadence, takeSurveyPeriod]);
 
@@ -676,7 +706,7 @@ export default function DashboardPage() {
             >
               <option value="">All Periods</option>
               {assessmentPeriodOptions.map((period) => (
-                <option key={period} value={period}>{formatPeriodLabel(period)}</option>
+                <option key={period} value={period}>{periodLabels[period] ?? formatPeriodLabel(period)}</option>
               ))}
             </select>
             {userPermissions.canExportData && healthSummary.length > 0 && (
@@ -1632,7 +1662,7 @@ export default function DashboardPage() {
               >
                 {takeSurveyPeriodOptions.map((p) => (
                   <option key={p} value={p}>
-                    {p}{p === autoTakeSurveyPeriod ? ' (current)' : ''}
+                    {formatPeriodLabel(p)}{p === autoTakeSurveyPeriod ? ' (current)' : ''}
                   </option>
                 ))}
               </select>
@@ -1664,7 +1694,7 @@ export default function DashboardPage() {
           </div>
         </div>
       )}
-      {duplicateInfo && (
+      {blockedInfo && (
         <div
           data-testid="duplicate-submission-modal"
           className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"
@@ -1681,12 +1711,12 @@ export default function DashboardPage() {
                   <AlertCircle className="w-5 h-5 text-amber-600" />
                 </div>
                 <h3 id="duplicate-submission-modal-title" className="text-xl font-semibold text-gray-900">
-                  Already Submitted
+                  {blockedInfo.reason === 'duplicate' ? 'Already Submitted' : 'Period Not Available'}
                 </h3>
               </div>
               <button
                 data-testid="duplicate-submission-close-icon"
-                onClick={() => setDuplicateInfo(null)}
+                onClick={() => setBlockedInfo(null)}
                 aria-label="Close"
                 className="text-gray-400 hover:text-gray-600 rounded-full p-1 transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
               >
@@ -1694,22 +1724,33 @@ export default function DashboardPage() {
               </button>
             </div>
             <div data-testid="duplicate-submission-message">
-              <p className="text-base text-gray-700 leading-relaxed mb-2">
-                You have already submitted the{' '}
-                <span className="font-semibold">
-                  {duplicateInfo.surveyType === 'post_workshop' ? 'Post-Workshop Survey' : 'Individual Survey'}
-                </span>{' '}
-                for <span className="font-semibold">{duplicateInfo.submittedPeriod}</span>.
-              </p>
-              <p className="text-base text-gray-700 leading-relaxed mb-8">
-                Your next survey is scheduled for{' '}
-                <span className="font-semibold">{duplicateInfo.nextEligiblePeriod}</span>.
-              </p>
+              {blockedInfo.reason === 'duplicate' ? (
+                <>
+                  <p className="text-base text-gray-700 leading-relaxed mb-2">
+                    {blockedInfo.surveyType === 'post_workshop' ? 'Your team has' : 'You have'} already submitted the{' '}
+                    <span className="font-semibold">
+                      {blockedInfo.surveyType === 'post_workshop' ? 'Post-Workshop Survey' : 'Individual Survey'}
+                    </span>{' '}
+                    for <span className="font-semibold">{blockedInfo.submittedPeriod}</span>.
+                  </p>
+                  {blockedInfo.nextEligiblePeriod && (
+                    <p className="text-base text-gray-700 leading-relaxed mb-8">
+                      Your next survey is scheduled for{' '}
+                      <span className="font-semibold">{blockedInfo.nextEligiblePeriod}</span>.
+                    </p>
+                  )}
+                </>
+              ) : (
+                <p className="text-base text-gray-700 leading-relaxed mb-8">
+                  <span className="font-semibold">{blockedInfo.submittedPeriod}</span> is not open for
+                  submission right now. Please choose a different assessment period.
+                </p>
+              )}
             </div>
             <div className="flex justify-end">
               <button
                 data-testid="duplicate-submission-close-button"
-                onClick={() => setDuplicateInfo(null)}
+                onClick={() => setBlockedInfo(null)}
                 className="px-6 py-3 text-base font-semibold whitespace-nowrap rounded-lg bg-gray-100 text-gray-700 transition-colors duration-150 hover:bg-gray-200 active:bg-gray-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-400 focus-visible:ring-offset-2"
               >
                 Close

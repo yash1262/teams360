@@ -151,32 +151,47 @@ export interface SurveyEligibility {
   // this rather than assuming every ineligible result is a duplicate -- submittedPeriod and
   // nextEligiblePeriod are only meaningful when reason is "duplicate".
   reason?: string;
-  // Populated only when reason is "duplicate": the user-facing H1/H2 label of the blocking
-  // submission's period, and the H1/H2 label the caller becomes eligible in. Never a
-  // day-level date -- the survey experience is based on month/year (period) values only.
+  // Populated only when reason is "duplicate": the user-facing label of the blocking
+  // submission's period (e.g. "H1 2026"), and the label the caller becomes eligible for next.
+  // The next label is absent when there is no later period to point to. Never a day-level
+  // date -- the survey experience is based on period values only.
   submittedPeriod?: string;
   nextEligiblePeriod?: string;
 }
 
 /**
- * Checks whether a survey can be submitted right now, before opening the survey form -- each
- * survey type can only be resubmitted once six calendar months have elapsed since the
- * scope's last completed submission of that type. Individual surveys are scoped to the
- * user; post-workshop surveys are scoped to the team.
+ * What to check. Each survey type is scoped to exactly one thing, and the endpoint rejects the
+ * request with a 400 without it: an Individual Survey to the user, a Post-Workshop Survey to
+ * the team.
+ */
+export type SurveyEligibilityParams =
+  | { surveyType: 'individual'; assessmentPeriod: string; userId: string; teamId?: string }
+  | { surveyType: 'post_workshop'; assessmentPeriod: string; teamId: string; userId?: string };
+
+/**
+ * Checks whether a survey can be submitted for a given assessment period right now, before
+ * opening the survey form. A scope may submit each survey type once per period (a half-year,
+ * month or year, depending on the team's cadence), and only for a period that is currently
+ * open. Individual surveys are scoped to the user; post-workshop surveys are scoped to the
+ * team. The server only answers about the caller's own submissions, or a team they belong to
+ * or lead.
  *
  * @param params.surveyType 'individual' or 'post_workshop'
- * @param params.assessmentPeriod Assessment period the survey would be recorded under (e.g. "H1 2026")
+ * @param params.assessmentPeriod Assessment period the survey would be recorded under (e.g. "2026 H1")
  * @param params.teamId Required when surveyType is 'post_workshop'
  * @param params.userId Required when surveyType is 'individual'
- * @returns Eligibility result; when ineligible, includes the already-submitted period and
- *          the next eligible H1/H2 period
+ * @returns Eligibility result; when ineligible, says why, and for a duplicate includes the
+ *          already-submitted period and the next eligible one
  */
-export async function checkSurveyEligibility(params: {
-  surveyType: 'individual' | 'post_workshop';
-  assessmentPeriod: string;
-  teamId?: string;
-  userId?: string;
-}): Promise<SurveyEligibility> {
+export async function checkSurveyEligibility(params: SurveyEligibilityParams): Promise<SurveyEligibility> {
+  // The type already forbids these shapes; the check protects callers that are not type-checked.
+  if (params.surveyType === 'individual' && !params.userId) {
+    throw new Error('checkSurveyEligibility: userId is required for an individual survey');
+  }
+  if (params.surveyType === 'post_workshop' && !params.teamId) {
+    throw new Error('checkSurveyEligibility: teamId is required for a post-workshop survey');
+  }
+
   const query = new URLSearchParams({
     surveyType: params.surveyType,
     assessmentPeriod: params.assessmentPeriod,

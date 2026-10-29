@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// TestNewSubmissionCooldownError_HalfYearMessage pins the exact "Already Submitted" message
+// TestNewDuplicateSubmissionError_HalfYearMessage pins the exact "Already Submitted" message
 // for both survey types, verifying the half-year rollover the product spec requires:
 //   - H1 submitted and H2 not submitted -> next eligible period is H2 of the SAME year.
 //   - H1 and H2 both submitted -> next eligible period is H1 of the FOLLOWING year.
@@ -13,7 +13,7 @@ import (
 //
 // It also asserts no quarter terminology (Q1-Q4) ever appears in the rendered message or in
 // either exposed period field, for either survey type.
-func TestNewSubmissionCooldownError_HalfYearMessage(t *testing.T) {
+func TestNewDuplicateSubmissionError_HalfYearMessage(t *testing.T) {
 	quarterPattern := regexp.MustCompile(`\bQ[1-4]\b`)
 
 	cases := []struct {
@@ -50,7 +50,7 @@ func TestNewSubmissionCooldownError_HalfYearMessage(t *testing.T) {
 			submittedPeriods:       []string{"2026 H1"},
 			wantLastSubmitted:      "H1 2026",
 			wantNextEligiblePeriod: "H2 2026",
-			wantMessage:            "You have already submitted the Post-Workshop Survey for H1 2026. Your next eligible survey period is H2 2026.",
+			wantMessage:            "Your team has already submitted the Post-Workshop Survey for H1 2026. Your team's next eligible survey period is H2 2026.",
 		},
 		{
 			name:                   "Post-Workshop Survey: only H2 submitted -> next eligible is H1 of the following year",
@@ -59,7 +59,7 @@ func TestNewSubmissionCooldownError_HalfYearMessage(t *testing.T) {
 			submittedPeriods:       []string{"2026 H2"},
 			wantLastSubmitted:      "H2 2026",
 			wantNextEligiblePeriod: "H1 2027",
-			wantMessage:            "You have already submitted the Post-Workshop Survey for H2 2026. Your next eligible survey period is H1 2027.",
+			wantMessage:            "Your team has already submitted the Post-Workshop Survey for H2 2026. Your team's next eligible survey period is H1 2027.",
 		},
 		{
 			// Legacy quarter-labeled historical data must still collapse safely to H1/H2 in
@@ -76,7 +76,7 @@ func TestNewSubmissionCooldownError_HalfYearMessage(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := NewSubmissionCooldownError(tc.surveyType, tc.duplicatedPeriod, tc.submittedPeriods)
+			err := NewDuplicateSubmissionError(tc.surveyType, tc.duplicatedPeriod, tc.submittedPeriods)
 
 			if err.LastSubmittedPeriod != tc.wantLastSubmitted {
 				t.Errorf("LastSubmittedPeriod = %q, want %q", err.LastSubmittedPeriod, tc.wantLastSubmitted)
@@ -125,6 +125,37 @@ func TestNewPeriodNotOpenError(t *testing.T) {
 			err := NewPeriodNotOpenError(tc.surveyType, tc.period, tc.reason)
 			if got := err.Error(); got != tc.wantMessage {
 				t.Errorf("Error() = %q, want %q", got, tc.wantMessage)
+			}
+		})
+	}
+}
+
+func TestDuplicateSubmissionError_MessageWithoutANextPeriod(t *testing.T) {
+	err := NewDuplicateSubmissionError(SurveyTypeIndividual, "2026 Mar", nil)
+
+	want := "You have already submitted the Individual Survey for 2026 Mar."
+	if got := err.Error(); got != want {
+		t.Errorf("Error() = %q, want %q (no dangling \"next eligible period is .\")", got, want)
+	}
+}
+
+func TestNewDuplicateSubmissionError_FollowsTheCadenceOfTheDuplicate(t *testing.T) {
+	cases := []struct {
+		name       string
+		duplicated string
+		submitted  []string
+		wantNext   string
+	}{
+		{"monthly moves to the next month", "2026 Mar", []string{"2026 Mar"}, "2026 Apr"},
+		{"monthly rolls over the year", "2026 Dec", []string{"2026 Dec"}, "2027 Jan"},
+		{"yearly moves to the next year", "2026", []string{"2026"}, "2027"},
+		{"a half-year history does not leak into a monthly answer", "2026 Mar", []string{"2026 H1", "2026 Mar"}, "2026 Apr"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := NewDuplicateSubmissionError(SurveyTypeIndividual, tc.duplicated, tc.submitted)
+			if err.NextEligiblePeriod != tc.wantNext {
+				t.Errorf("NextEligiblePeriod = %q, want %q", err.NextEligiblePeriod, tc.wantNext)
 			}
 		})
 	}
