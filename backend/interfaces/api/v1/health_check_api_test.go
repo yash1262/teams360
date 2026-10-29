@@ -95,7 +95,7 @@ var _ = Describe("Health Check API", func() {
 					"teamId":           "team1",
 					"userId":           "user123",
 					"date":             time.Now().Format(time.RFC3339),
-					"assessmentPeriod": "2024 - 2nd Half",
+					"assessmentPeriod": currentPeriod(),
 					"responses": []map[string]interface{}{
 						{
 							"dimensionId": "mission",
@@ -158,9 +158,10 @@ var _ = Describe("Health Check API", func() {
 			It("should auto-generate session ID if not provided", func() {
 				// Given: Submission without ID
 				submission := map[string]interface{}{
-					"teamId": "team1",
-					"userId": "user123",
-					"date":   time.Now().Format(time.RFC3339),
+					"teamId":           "team1",
+					"userId":           "user123",
+					"date":             time.Now().Format(time.RFC3339),
+					"assessmentPeriod": currentPeriod(),
 					"responses": []map[string]interface{}{
 						{
 							"dimensionId": "mission",
@@ -348,9 +349,10 @@ var _ = Describe("Health Check API", func() {
 			It("should return the session with all responses", func() {
 				// Given: An existing session
 				submission := map[string]interface{}{
-					"teamId": "team1",
-					"userId": "user123",
-					"date":   time.Now().Format(time.RFC3339),
+					"teamId":           "team1",
+					"userId":           "user123",
+					"date":             time.Now().Format(time.RFC3339),
+					"assessmentPeriod": currentPeriod(),
 					"responses": []map[string]interface{}{
 						{"dimensionId": "mission", "score": 3, "trend": "improving", "comment": "Great"},
 					},
@@ -409,9 +411,10 @@ var _ = Describe("Health Check API", func() {
 				// Given: Multiple sessions for team1
 				for i := 0; i < 3; i++ {
 					submission := map[string]interface{}{
-						"teamId": "team1",
-						"userId": "user" + string(rune(i+1)),
-						"date":   time.Now().Format(time.RFC3339),
+						"teamId":           "team1",
+						"userId":           "user" + string(rune(i+1)),
+						"date":             time.Now().Format(time.RFC3339),
+						"assessmentPeriod": currentPeriod(),
 						"responses": []map[string]interface{}{
 							{"dimensionId": "mission", "score": 3, "trend": "improving"},
 						},
@@ -445,37 +448,17 @@ var _ = Describe("Health Check API", func() {
 
 		Context("when filtering by assessment period", func() {
 			It("should return only sessions from that period", func() {
-				// Given: Sessions from different periods
-				submission1 := map[string]interface{}{
-					"teamId":           "team1",
-					"userId":           "user1",
-					"date":             "2024-01-15T10:00:00Z",
-					"assessmentPeriod": "2023 - 2nd Half",
-					"responses": []map[string]interface{}{
-						{"dimensionId": "mission", "score": 3, "trend": "improving"},
-					},
-					"completed": true,
-				}
-
-				submission2 := map[string]interface{}{
-					"teamId":           "team1",
-					"userId":           "user2",
-					"date":             "2024-07-15T10:00:00Z",
-					"assessmentPeriod": "2024 - 1st Half",
-					"responses": []map[string]interface{}{
-						{"dimensionId": "value", "score": 2, "trend": "stable"},
-					},
-					"completed": true,
-				}
-
-				// Post both submissions
-				for _, sub := range []map[string]interface{}{submission1, submission2} {
-					body, _ := json.Marshal(sub)
-					req := httptest.NewRequest(http.MethodPost, "/api/v1/health-checks", bytes.NewBuffer(body))
-					req.Header.Set("Content-Type", "application/json")
-					req.Header.Set("Authorization", "Bearer "+userToken)
-					w := httptest.NewRecorder()
-					router.ServeHTTP(w, req)
+				// Given: Sessions from different periods. They are seeded directly because the API
+				// only accepts a currently open period, and this test needs two older ones.
+				for _, row := range []struct{ id, user, date, period string }{
+					{"filter-session-1", "user1", "2024-01-15", "2023 - 2nd Half"},
+					{"filter-session-2", "user2", "2024-07-15", "2024 - 1st Half"},
+				} {
+					_, err := db.Exec(`
+						INSERT INTO health_check_sessions (id, team_id, user_id, date, assessment_period, survey_type, completed)
+						VALUES ($1, 'team1', $2, $3, $4, 'individual', true)
+					`, row.id, row.user, row.date, row.period)
+					Expect(err).NotTo(HaveOccurred())
 				}
 
 				// When: Filtering by period
