@@ -3,7 +3,7 @@ package v1
 import (
 	"context"
 	"errors"
-	"strings"
+	"fmt"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -230,7 +230,30 @@ var _ = Describe("survey reminders", func() {
 			Expect(sender.sent[0].subject).To(ContainSubstring("2026 - 1st Half"))
 			Expect(sender.sent[0].body).To(ContainSubstring("Team &lt;One&gt;"), "pod names must be HTML-escaped")
 			Expect(sender.sent[0].body).NotTo(ContainSubstring("Team <One>"))
-			Expect(strings.Contains(sender.sent[0].body, "1 / 4")).To(BeTrue())
+			Expect(sender.sent[0].body).To(ContainSubstring("1 / 4"))
+		})
+
+		It("carries the pod's survey progress, status and team lead into the email", func() {
+			sender := &fakeReminderSender{}
+			lead := "Yash <Jambotkar>"
+			notDone := false
+			full := dto.SurveyCompletionTeamDTO{
+				TeamID: "t9", TeamName: "HopeFarm", Completed: 1, Total: 5, Status: "in_progress",
+				PostWorkshopCompleted: &notDone, TeamLeadName: &lead,
+			}
+
+			sendReminderPlan(context.Background(), sender, "2026 Q4", "team", mkPlan(
+				&reminderRecipient{UserID: "u1", Name: "Ann", Email: "ann@x.com", Role: "leader", Pods: []dto.SurveyCompletionTeamDTO{full}},
+			))
+
+			body := sender.sent[0].body
+			Expect(body).To(ContainSubstring("HopeFarm"))
+			Expect(body).To(ContainSubstring("Individual Survey"))
+			Expect(body).To(ContainSubstring("1 / 5"))
+			Expect(body).To(ContainSubstring("Post-Workshop Survey"))
+			Expect(body).To(ContainSubstring("0 / 1"))
+			Expect(body).To(ContainSubstring("In progress"))
+			Expect(body).To(ContainSubstring("Yash &lt;Jambotkar&gt;"), "the team lead, escaped")
 		})
 
 		It("skips a recipient with no email and carries on", func() {
@@ -420,5 +443,63 @@ var _ = Describe("survey reminder test-pod restriction and log mode", func() {
 			Expect(resp.Sent).To(Equal(4))
 			Expect(resp.Logged).To(BeZero())
 		})
+	})
+})
+
+var _ = Describe("toReminderPod", func() {
+	yes, no := true, false
+
+	surveys := func(p dto.SurveyCompletionTeamDTO) map[string]string {
+		out := map[string]string{}
+		for _, sv := range toReminderPod(p).Surveys {
+			if sv.NotApplicable {
+				out[sv.Label] = "—"
+			} else {
+				out[sv.Label] = fmt.Sprintf("%d / %d", sv.Completed, sv.Total)
+			}
+		}
+		return out
+	}
+
+	It("reports the individual survey as members completed over members eligible", func() {
+		got := surveys(dto.SurveyCompletionTeamDTO{Completed: 3, Total: 8, Status: "in_progress", PostWorkshopCompleted: &no})
+
+		Expect(got).To(HaveKeyWithValue("Individual Survey", "3 / 8"))
+	})
+
+	It("reports the post-workshop survey as one per team: 0 / 1 until done, 1 / 1 after", func() {
+		Expect(surveys(dto.SurveyCompletionTeamDTO{Completed: 2, Total: 2, Status: "in_progress", PostWorkshopCompleted: &no})).
+			To(HaveKeyWithValue("Post-Workshop Survey", "0 / 1"))
+		Expect(surveys(dto.SurveyCompletionTeamDTO{Completed: 2, Total: 2, Status: "complete", PostWorkshopCompleted: &yes})).
+			To(HaveKeyWithValue("Post-Workshop Survey", "1 / 1"))
+	})
+
+	It("marks every survey not applicable when the pod has opted out", func() {
+		got := surveys(dto.SurveyCompletionTeamDTO{Completed: 4, Total: 4, Status: "opted_out", PostWorkshopCompleted: nil})
+
+		Expect(got).To(HaveKeyWithValue("Individual Survey", "—"))
+		Expect(got).To(HaveKeyWithValue("Post-Workshop Survey", "—"))
+	})
+
+	It("marks the individual survey not applicable when nobody is eligible for it", func() {
+		got := surveys(dto.SurveyCompletionTeamDTO{Completed: 0, Total: 0, Status: "not_started", PostWorkshopCompleted: &no})
+
+		Expect(got).To(HaveKeyWithValue("Individual Survey", "—"))
+		Expect(got).To(HaveKeyWithValue("Post-Workshop Survey", "0 / 1"))
+	})
+
+	It("marks the post-workshop survey not applicable when no state is reported for it", func() {
+		got := surveys(dto.SurveyCompletionTeamDTO{Completed: 1, Total: 2, Status: "in_progress", PostWorkshopCompleted: nil})
+
+		Expect(got).To(HaveKeyWithValue("Post-Workshop Survey", "—"))
+	})
+
+	It("keeps the pod's name, status and team lead", func() {
+		lead := "Yash Jambotkar"
+		pod := toReminderPod(dto.SurveyCompletionTeamDTO{TeamName: "HopeFarm", Status: "in_progress", TeamLeadName: &lead})
+
+		Expect(pod.Name).To(Equal("HopeFarm"))
+		Expect(pod.Status).To(Equal("in_progress"))
+		Expect(pod.TeamLeadName).To(Equal("Yash Jambotkar"))
 	})
 })

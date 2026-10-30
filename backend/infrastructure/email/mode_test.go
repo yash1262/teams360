@@ -54,21 +54,6 @@ func TestDeliversIsTrueForOrdinarySenders(t *testing.T) {
 	}
 }
 
-func TestReminderTextListsEachPodWithItsProgress(t *testing.T) {
-	text := RenderSurveyReminderText(SurveyReminderEmailData{
-		RecipientName:    "Yash",
-		Role:             "team lead",
-		AssessmentPeriod: "2026 - 1st Half",
-		Pods:             []ReminderPod{{Name: "Hopefarm", Completed: 1, Total: 4, Status: "in_progress"}},
-	})
-
-	for _, want := range []string{"Hi Yash,", "Your pod still needs to complete the survey: 2026 - 1st Half", "Hopefarm: 1 / 4 completed (In progress)"} {
-		if !strings.Contains(text, want) {
-			t.Errorf("text is missing %q:\n%s", want, text)
-		}
-	}
-}
-
 func TestReminderIntroDiffersForLeaders(t *testing.T) {
 	leader := RenderSurveyReminderText(SurveyReminderEmailData{RecipientName: "A", Role: "leader", AssessmentPeriod: "p"})
 	if !strings.Contains(leader, "These pods still need to complete the survey:") {

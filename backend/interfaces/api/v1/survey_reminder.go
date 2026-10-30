@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/agopalakrishnan/teams360/backend/application/queries"
+	"github.com/agopalakrishnan/teams360/backend/domain/healthcheck"
 	"github.com/agopalakrishnan/teams360/backend/domain/team"
 	"github.com/agopalakrishnan/teams360/backend/infrastructure/email"
 	"github.com/agopalakrishnan/teams360/backend/interfaces/dto"
@@ -317,6 +318,53 @@ func restrictPlanToTestPod(ctx context.Context, plan *reminderPlan, podName stri
 	return out, nil
 }
 
+// surveyLabel is the name a survey type goes by in the email.
+func surveyLabel(surveyType string) string {
+	switch surveyType {
+	case healthcheck.SurveyTypePostWorkshop:
+		return "Post-Workshop Survey"
+	case healthcheck.SurveyTypeIndividual:
+		return "Individual Survey"
+	default:
+		return surveyType
+	}
+}
+
+// toReminderPod turns the dashboard's data for a pod into the email's per-survey progress. Every
+// number comes from that data: the Individual Survey is the members who completed out of those
+// eligible, and the Post-Workshop Survey is one per team per period, so it reads 1 / 1 once
+// done and 0 / 1 until then. A survey that does not apply (the pod opted out, nobody is
+// eligible, or no post-workshop state is reported) is marked not applicable and shows as "—".
+func toReminderPod(p dto.SurveyCompletionTeamDTO) email.ReminderPod {
+	optedOut := p.Status == "opted_out"
+
+	individual := email.SurveyProgress{
+		Label:         surveyLabel(healthcheck.SurveyTypeIndividual),
+		Completed:     p.Completed,
+		Total:         p.Total,
+		NotApplicable: optedOut || p.Total <= 0,
+	}
+
+	postWorkshop := email.SurveyProgress{
+		Label:         surveyLabel(healthcheck.SurveyTypePostWorkshop),
+		Total:         1,
+		NotApplicable: optedOut || p.PostWorkshopCompleted == nil,
+	}
+	if p.PostWorkshopCompleted != nil && *p.PostWorkshopCompleted {
+		postWorkshop.Completed = 1
+	}
+
+	pod := email.ReminderPod{
+		Name:    p.TeamName,
+		Status:  p.Status,
+		Surveys: []email.SurveyProgress{individual, postWorkshop},
+	}
+	if p.TeamLeadName != nil {
+		pod.TeamLeadName = *p.TeamLeadName
+	}
+	return pod
+}
+
 // sendReminderPlan mails every recipient in the plan and reports the outcome.
 // A recipient with no email address is skipped and one the transport rejects
 // is recorded as failed; neither stops the rest of the run.
@@ -353,7 +401,7 @@ func sendReminderPlan(ctx context.Context, sender email.Sender, assessmentPeriod
 			reminderPods := make([]email.ReminderPod, len(r.Pods))
 			for i, p := range r.Pods {
 				podNames[i] = p.TeamName
-				reminderPods[i] = email.ReminderPod{Name: p.TeamName, Completed: p.Completed, Total: p.Total, Status: p.Status}
+				reminderPods[i] = toReminderPod(p)
 			}
 			log.WithFields(map[string]interface{}{
 				"recipient_name":  r.Name,
@@ -376,7 +424,7 @@ func sendReminderPlan(ctx context.Context, sender email.Sender, assessmentPeriod
 
 		pods := make([]email.ReminderPod, len(r.Pods))
 		for i, p := range r.Pods {
-			pods[i] = email.ReminderPod{Name: p.TeamName, Completed: p.Completed, Total: p.Total, Status: p.Status}
+			pods[i] = toReminderPod(p)
 		}
 		body := email.RenderSurveyReminderEmail(email.SurveyReminderEmailData{
 			RecipientName:    r.Name,
