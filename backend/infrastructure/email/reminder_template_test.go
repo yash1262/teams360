@@ -175,3 +175,18 @@ func TestReminderWithNoPodsStillRenders(t *testing.T) {
 	mustContain(t, "html", htmlBody, "Hi Yash,", "<table")
 	mustContain(t, "text", text, "Hi Yash,")
 }
+
+func TestSurveyReminderSubject(t *testing.T) {
+	cases := map[string]string{
+		"2026 Q4": "Your Pod Health Check Survey Reminder: 2026 Q4",
+		"":        "Your Pod Health Check Survey Reminder",
+	}
+	for period, want := range cases {
+		if got := SurveyReminderSubject(period); got != want {
+			t.Errorf("SurveyReminderSubject(%q) = %q, want %q", period, got, want)
+		}
+	}
+	if got := SurveyReminderSubject("2026 Q4"); strings.ContainsAny(got, "@[]") {
+		t.Errorf("subject must not carry an address or label: %q", got)
+	}
+}

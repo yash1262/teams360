@@ -54,12 +54,18 @@ type SurveyReminderEmailData struct {
 	Pods             []ReminderPod
 }
 
-// SurveyReminderSubject is the subject line of a survey reminder email.
+// reminderSubjectBase is the fixed start of every survey reminder subject.
+const reminderSubjectBase = "Your Pod Health Check Survey Reminder"
+
+// SurveyReminderSubject is the subject line of a survey reminder email, for example
+// "Your Pod Health Check Survey Reminder: 2026 Q4". It is built only from the assessment
+// period, so it never carries a recipient's address or a test label, and every reminder
+// email uses it.
 func SurveyReminderSubject(assessmentPeriod string) string {
 	if assessmentPeriod == "" {
-		return "Teams360 - Survey reminder"
+		return reminderSubjectBase
 	}
-	return "Teams360 - Survey reminder: " + assessmentPeriod
+	return reminderSubjectBase + ": " + assessmentPeriod
 }
 
 func reminderIntro(role string) string {

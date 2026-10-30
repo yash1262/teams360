@@ -106,7 +106,7 @@ var _ = Describe("Integration: Survey Completion Reminders", func() {
 
 		Expect(mailer.SentHTMLEmails).To(HaveLen(1))
 		Expect(mailer.SentHTMLEmails[0].To).To(Equal("remlead@test.com"))
-		Expect(mailer.SentHTMLEmails[0].Subject).To(ContainSubstring("Survey reminder"))
+		Expect(mailer.SentHTMLEmails[0].Subject).To(ContainSubstring("Pod Health Check Survey Reminder"))
 		Expect(mailer.SentHTMLEmails[0].Body).To(ContainSubstring("Reminder Team"))
 	})
 
