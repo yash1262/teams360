@@ -81,46 +81,19 @@ func TestRedirectSenderNeverUsesTheRealRecipient(t *testing.T) {
 	}
 }
 
-func TestRedirectSenderNamesTheOriginalRecipient(t *testing.T) {
+func TestRedirectSenderLeavesTheEmailUnchanged(t *testing.T) {
 	inner := &recordingSender{}
 	s := NewRedirectSender(inner, []string{"cw1@x.com"})
+	body := "<html><body style=\"x\"><p>hi</p></body></html>"
 
-	_ = s.SendHTML(context.Background(), "real@x.com", "Survey reminder", "<html><body style=\"x\"><p>hi</p></body></html>")
+	_ = s.SendHTML(context.Background(), "real@x.com", "Survey reminder", body)
 
 	c := inner.calls[0]
-	if !strings.HasPrefix(c.subject, "[TEST - for real@x.com] ") || !strings.HasSuffix(c.subject, "Survey reminder") {
-		t.Errorf("subject = %q", c.subject)
+	if c.subject != "Survey reminder" || c.body != body {
+		t.Errorf("email was altered: subject=%q body=%s", c.subject, c.body)
 	}
-	if !strings.Contains(c.body, "originally addressed to <strong>real@x.com</strong>") {
-		t.Errorf("body is missing the banner: %s", c.body)
-	}
-	if strings.Index(c.body, "TEST MODE") > strings.Index(c.body, "<p>hi</p>") {
-		t.Error("the banner must come before the original content")
-	}
-	if !strings.Contains(c.body, `<body style="x">`) {
-		t.Error("the original body tag must be kept intact")
-	}
-}
-
-func TestRedirectBannerEscapesTheOriginalAddress(t *testing.T) {
-	inner := &recordingSender{}
-	s := NewRedirectSender(inner, []string{"cw1@x.com"})
-
-	_ = s.SendHTML(context.Background(), `"><script>alert(1)</script>@x.com`, "s", "<body></body>")
-
-	if strings.Contains(inner.calls[0].body, "<script>") {
-		t.Errorf("the original address must be HTML-escaped: %s", inner.calls[0].body)
-	}
-}
-
-func TestRedirectSenderStripsLineBreaksFromTheSubject(t *testing.T) {
-	inner := &recordingSender{}
-	s := NewRedirectSender(inner, []string{"cw1@x.com"})
-
-	_ = s.SendHTML(context.Background(), "real@x.com\r\nBcc: evil@x.com", "s", "<body></body>")
-
-	if strings.ContainsAny(inner.calls[0].subject, "\r\n") {
-		t.Errorf("subject must not contain line breaks: %q", inner.calls[0].subject)
+	if strings.Contains(c.subject+c.body, "real@x.com") {
+		t.Error("the real recipient must not appear in what is delivered")
 	}
 }
 

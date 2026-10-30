@@ -3,7 +3,6 @@ package email
 import (
 	"context"
 	"fmt"
-	"html"
 	"net/mail"
 	"strings"
 
@@ -47,9 +46,10 @@ func RedirectTargets(raw string) (targets []string, configured bool, err error) 
 }
 
 // RedirectSender wraps a real Sender and delivers every email to a fixed list
-// of test addresses instead of the address it was meant for. The original
-// recipient is named in the subject and in a banner at the top of the body,
-// and is never passed to the wrapped sender.
+// of test addresses instead of the address it was meant for. The email itself
+// is sent unchanged, so it reads exactly as a real one would. The original
+// recipient is only recorded in the server log and is never passed to the
+// wrapped sender.
 type RedirectSender struct {
 	inner Sender
 	to    []string
@@ -69,13 +69,14 @@ func (r *RedirectSender) Delivers() bool { return Delivers(r.inner) }
 
 // SendHTML delivers one copy of the email to each test address.
 func (r *RedirectSender) SendHTML(ctx context.Context, to, subject, htmlBody string) error {
-	original := strings.NewReplacer("\r", "", "\n", "").Replace(to)
-	testSubject := "[TEST - for " + original + "] " + subject
-	testBody := withTestBanner(htmlBody, original)
+	logger.Get().
+		WithField("intended_to", strings.NewReplacer("\r", "", "\n", "").Replace(to)).
+		WithField("delivered_to", r.to).
+		Info("reminder email redirected")
 
 	var firstErr error
 	for _, target := range r.to {
-		if err := r.inner.SendHTML(ctx, target, testSubject, testBody); err != nil && firstErr == nil {
+		if err := r.inner.SendHTML(ctx, target, subject, htmlBody); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -99,21 +100,4 @@ func RedirectTargetsOf(s Sender) []string {
 		return r.RedirectTargets()
 	}
 	return nil
-}
-
-// withTestBanner puts a notice naming the original recipient at the top of
-// the email body.
-func withTestBanner(body, original string) string {
-	banner := `<div style="margin:0 0 16px;padding:12px 16px;background:#FEF3C7;border:1px solid #F59E0B;` +
-		`color:#92400E;font:14px -apple-system,Segoe UI,Roboto,sans-serif;">TEST MODE: this email was originally ` +
-		`addressed to <strong>` + html.EscapeString(original) + `</strong> and was redirected to you. ` +
-		`The real recipient did not receive it.</div>`
-
-	if i := strings.Index(strings.ToLower(body), "<body"); i >= 0 {
-		if j := strings.Index(body[i:], ">"); j >= 0 {
-			k := i + j + 1
-			return body[:k] + banner + body[k:]
-		}
-	}
-	return banner + body
 }
